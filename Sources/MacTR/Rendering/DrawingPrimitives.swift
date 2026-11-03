@@ -14,53 +14,46 @@ enum Draw {
     /// Draw vertical gradient background.
     /// In flipped context: Y=0 is top, so bgTop at y=0, bgBot at y=height.
     static func gradientBackground(_ ctx: CGContext) {
+        guard let bg = backgroundImage else { return }
+        ctx.saveGState()
+        // Undo flip: an untransformed, same-size .copy blit takes CG's memcpy fast
+        // path (~0.3ms) instead of shading the full gradient every frame (~3.4ms).
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: 0, y: -CGFloat(Layout.height))
+        ctx.setBlendMode(.copy)
+        ctx.draw(bg, in: CGRect(x: 0, y: 0, width: Layout.width, height: Layout.height))
+        ctx.restoreGState()
+    }
+
+    /// The vertical background gradient, rendered once.
+    private static let backgroundImage: CGImage? = {
         let colors = [Color.bgTop, Color.bgBot] as CFArray
         guard let gradient = CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
-            colors: colors, locations: [0, 1])
-        else { return }
-
-        ctx.saveGState()
-        // Undo flip for gradient (drawLinearGradient uses native CG coords)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.translateBy(x: 0, y: -CGFloat(Layout.height))
+            colors: colors, locations: [0, 1]),
+            let ctx = CGContext(
+                data: nil, width: Layout.width, height: Layout.height,
+                bitsPerComponent: 8, bytesPerRow: Layout.width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // Native CG coords: bgTop at the top edge (y = height)
         ctx.drawLinearGradient(
             gradient,
             start: CGPoint(x: 0, y: CGFloat(Layout.height)),
             end: CGPoint(x: 0, y: 0),
             options: [])
-        ctx.restoreGState()
-    }
+        return ctx.makeImage()
+    }()
 
     // MARK: - Panel
 
-    /// Draw a rounded panel with accent color top bar.
-    /// Assumes flipped context (Y=0 at top).
-    static func panel(_ ctx: CGContext, x: Int, y: Int, w: Int, h: Int, accent: CGColor) {
+    /// Draw a rounded panel. Assumes flipped context (Y=0 at top).
+    static func panel(_ ctx: CGContext, x: Int, y: Int, w: Int, h: Int, radius: CGFloat = 16) {
         let rect = CGRect(x: x, y: y, width: w, height: h)
-        let path = CGPath(roundedRect: rect, cornerWidth: 16, cornerHeight: 16, transform: nil)
         ctx.setFillColor(Color.panelBG)
-        ctx.addPath(path)
+        ctx.addPath(CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil))
         ctx.fillPath()
-
-        // Accent bar at top (y is top in flipped coords)
-        let barRect = CGRect(x: x + 2, y: y, width: w - 4, height: 3)
-        let barPath = CGPath(roundedRect: barRect, cornerWidth: 2, cornerHeight: 2, transform: nil)
-        ctx.setFillColor(accent)
-        ctx.addPath(barPath)
-        ctx.fillPath()
-
-        // Subtle glow below accent
-        for i in 0..<6 {
-            let t = 1.0 - Double(i) / 6.0
-            let alpha = 0.12 * t
-            ctx.setStrokeColor(accent.copy(alpha: CGFloat(alpha)) ?? accent)
-            ctx.setLineWidth(1)
-            let lineY = CGFloat(y + 4 + i)
-            ctx.move(to: CGPoint(x: CGFloat(x + 2), y: lineY))
-            ctx.addLine(to: CGPoint(x: CGFloat(x + w - 2), y: lineY))
-            ctx.strokePath()
-        }
     }
 
     // MARK: - Arc Gauge
@@ -138,21 +131,52 @@ enum Draw {
 
     // MARK: - Text
 
-    /// Draw text at position. Assumes context is already flipped (Y=0 at top).
+    // Typeset once: the panel draws the same few hundred texts in the same
+    // fonts and colours again and again, and laying a text out (font fallback
+    // for Chinese, shaping) is most of what drawing it costs
+    private struct TextKey: Hashable {
+        let string: String
+        let font: NSFont
+        let color: CGColor?   // nil: measured only
+    }
+    nonisolated(unsafe) private static var lines: [TextKey: CTLine] = [:]
+    private static let linesLock = NSLock()
+
+    private static func line(_ string: String, font: NSFont, color: CGColor?) -> CTLine {
+        let key = TextKey(string: string, font: font, color: color)
+        linesLock.lock()
+        defer { linesLock.unlock() }
+        if let l = lines[key] { return l }
+        if lines.count > 4000 { lines.removeAll(keepingCapacity: true) }   // texts that tick come and go
+        var attrs: [NSAttributedString.Key: Any] = [.font: font]
+        if let color { attrs[NSAttributedString.Key(kCTForegroundColorAttributeName as String)] = color }
+        let l = CTLineCreateWithAttributedString(NSAttributedString(string: string, attributes: attrs))
+        lines[key] = l
+        return l
+    }
+
+    /// A text's width, as drawn.
+    static func width(_ string: String, font: NSFont) -> CGFloat {
+        CGFloat(CTLineGetTypographicBounds(line(string, font: font, color: nil), nil, nil, nil))
+    }
+
+    /// Draw text with its line's top-left at a position, as NSString drawing
+    /// in a flipped view does. Assumes context is already flipped (Y=0 at top).
     static func text(
         _ ctx: CGContext, _ string: String, x: Int, y: Int,
         font: NSFont, color: CGColor
     ) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor(cgColor: color) ?? .white,
-        ]
-        let nsStr = string as NSString
-
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
-        nsStr.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
-        NSGraphicsContext.restoreGraphicsState()
+        let l = line(string, font: font, color: color)
+        var ascent: CGFloat = 0
+        CTLineGetTypographicBounds(l, &ascent, nil, nil)
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        let matrix = ctx.textMatrix
+        ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)   // upright glyphs in a flipped context
+        // NSString drawing puts the baseline at the ascent rounded (matched pixel for pixel)
+        ctx.textPosition = CGPoint(x: CGFloat(x), y: CGFloat(y) + ascent.rounded())
+        CTLineDraw(l, ctx)
+        ctx.textMatrix = matrix
     }
 
     /// Draw centered text
@@ -160,12 +184,7 @@ enum Draw {
         _ ctx: CGContext, _ string: String, cx: Int, y: Int,
         font: NSFont, color: CGColor
     ) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor(cgColor: color) ?? .white,
-        ]
-        let size = (string as NSString).size(withAttributes: attrs)
-        let x = CGFloat(cx) - size.width / 2
+        let x = CGFloat(cx) - width(string, font: font) / 2
         text(ctx, string, x: Int(x), y: y, font: font, color: color)
     }
 

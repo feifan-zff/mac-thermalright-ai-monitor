@@ -12,20 +12,10 @@ let package = Package(
             pkgConfig: "libusb-1.0",
             providers: [.brew(["libusb"])]
         ),
-        .target(
-            name: "CThermalSensor",
-            path: "Sources/CThermalSensor",
-            publicHeadersPath: "include",
-            linkerSettings: [
-                .linkedFramework("IOKit"),
-                .linkedFramework("Foundation"),
-            ]
-        ),
         .executableTarget(
             name: "MacTR",
             dependencies: [
                 "CLibUSB",
-                "CThermalSensor",
             ],
             path: "Sources/MacTR",
             swiftSettings: [

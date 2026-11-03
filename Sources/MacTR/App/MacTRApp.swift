@@ -32,41 +32,32 @@ struct MacTREntry {
             return
         }
 
-        // Demo mode: drive the LCD with polished fake data (for photos / showcase).
-        if CommandLine.arguments.contains("--demo") {
-            runDemo()
-            return
-        }
-
         // GIF mode: render an animated demo GIF (for the README). No LCD needed.
         if CommandLine.arguments.contains("--gif") {
             runGif()
             return
         }
 
-        // Snapshot mode: render one frame and save as PNG
-        // Usage: --snapshot path.png [--cores N]
+        // Pipeline benchmark: CPU cost per frame of render + encode, no USB.
+        // Usage: --pipeline-bench [--brightness N]
+        if CommandLine.arguments.contains("--pipeline-bench") {
+            runPipelineBench()
+            return
+        }
+
+        // Snapshot mode: render one frame and save as PNG (or the device JPEG)
+        // Usage: --snapshot path.png|path.jpg [--brightness N] [--rotate]
         if CommandLine.arguments.contains("--snapshot") {
-            let renderer = MonitorRenderer()
-            let simCores = parseFlag(CommandLine.arguments, flag: "--cores")
-
-            // Prime metrics collection (required for real data render)
-            renderer.startMetrics()
-            Thread.sleep(forTimeInterval: 0.5)
-            for _ in 0..<30 { _ = renderer.render(); Thread.sleep(forTimeInterval: 0.1) }
-
-            let image: CGImage?
-            if let cores = simCores {
-                log("[Snapshot] Simulating \(cores) cores")
-                image = renderer.renderSimulated(coreCount: cores)
-            } else {
-                image = renderer.render()
-            }
-
-            if let image {
+            if let image = primedRenderer().render() {
                 let url = URL(fileURLWithPath: CommandLine.arguments.last == "--snapshot"
                     ? "snapshot.png" : CommandLine.arguments[CommandLine.arguments.firstIndex(of: "--snapshot")! + 1])
-                if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                if url.pathExtension == "jpg" {
+                    // The exact bytes the LCD receives (device orientation, brightness applied)
+                    let level = parseFlag(CommandLine.arguments, flag: "--brightness") ?? 1
+                    let rotate = CommandLine.arguments.contains("--rotate")
+                    try? JPEGEncoder.encode(image, brightness: level, rotate: rotate)?.write(to: url)
+                    log("[Snapshot] Saved device JPEG to \(url.path)")
+                } else if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
                     CGImageDestinationAddImage(dest, image, nil)
                     CGImageDestinationFinalize(dest)
                     log("[Snapshot] Saved to \(url.path)")
@@ -101,7 +92,7 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     private var window: NSWindow!
     private var imageView: NSImageView!
-    private let renderer = MonitorRenderer()
+    private let renderer = MagpieRenderer()
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -127,11 +118,7 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
         NSApp.activate(ignoringOtherApps: true)
 
         renderer.startMetrics()
-        if CommandLine.arguments.contains("--test-flash") {
-            renderer.enableTestFlash(seconds: 10)
-        }
-        // 10fps so the breathing/blink animations look smooth on-screen (metrics
-        // themselves are cached and only recomputed every ~2s in the background)
+        // 10fps, matching the LCD's animation rate (data itself is polled every 1s)
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
@@ -173,9 +160,25 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var versionMenuItem: NSMenuItem!
     private var reconnectItem: NSMenuItem!
     private var updateTimer: Timer?
+    private var quitSignals: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[*] MacTR starting...")
+
+        // pkill / logout / ⌃C quit like the menu's Quit does — through
+        // applicationWillTerminate, which lets the frame being sent finish
+        // (a frame cut short leaves the LCD deaf until it is unplugged)
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { NSApp.terminate(nil) }
+            source.resume()
+            quitSignals.append(source)
+        }
+
+        // Accessory apps show no menu bar, but AppKit still routes ⌘X/⌘C/⌘V/⌘A/⌘Z
+        // through NSApp.mainMenu — without one, Settings' text fields can't paste.
+        NSApp.mainMenu = Self.makeEditMenu()
 
         // Create status bar item — this NEVER gets removed
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -308,6 +311,23 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         return image
     }
 
+    private static func makeEditMenu() -> NSMenu {
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+            .keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem()
+        editItem.submenu = edit
+        let main = NSMenu()
+        main.addItem(editItem)
+        return main
+    }
+
     // MARK: - Menu
 
     private func buildMenu() {
@@ -340,6 +360,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let previewItem = NSMenuItem(title: "Preview Window", action: #selector(showPreviewManually), keyEquivalent: "p")
         previewItem.target = self
         menu.addItem(previewItem)
+
+        // Night blanking (18:30–09:00) on/off
+        let nightItem = NSMenuItem(title: "Blank LCD at Night", action: #selector(toggleNightBlank(_:)), keyEquivalent: "")
+        nightItem.target = self
+        nightItem.state = NightSchedule.isEnabled ? .on : .off
+        menu.addItem(nightItem)
 
         menu.addItem(.separator())
 
@@ -430,6 +456,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         showPreview(); previewShown = true
     }
 
+    @objc private func toggleNightBlank(_ sender: NSMenuItem) {
+        NightSchedule.isEnabled.toggle()
+        sender.state = NightSchedule.isEnabled ? .on : .off
+        updateDisplayTarget()
+    }
+
     // User closed the preview window — stop rendering to it. previewShown stays true
     // so we don't immediately reopen it; it comes back on the next display-target
     // transition (LCD unplug, or entering/leaving the night window).
@@ -467,7 +499,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.informativeText = """
             Version \(version) (Build \(build))
 
-            AI agent + system monitor for the
+            magpie routing + subscription usage on the
             Thermalright Trofeo Vision 9.16 LCD.
 
             Built with Swift + libusb
@@ -515,9 +547,12 @@ private func runBenchmark() {
     do { _ = try LYProtocol.handshake(device: device) }
     catch { print("[Bench][ERROR] handshake failed: \(error)"); return }
 
-    let renderer = MonitorRenderer()
-    renderer.startMetrics()
-    Thread.sleep(forTimeInterval: 1.0)  // prime metrics so render() returns frames
+    // --static: re-send one pre-encoded frame — isolates device + USB throughput
+    let renderer = primedRenderer()
+    var staticJPEG: Data?
+    if args.contains("--static"), let img = renderer.render() {
+        staticJPEG = JPEGEncoder.encode(img, brightness: brightness, rotate: rotate)
+    }
 
     func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000 }  // ms
 
@@ -536,9 +571,11 @@ private func runBenchmark() {
 
     for _ in 0..<frames {
         let r0 = now()
-        guard let image = renderer.render() else { continue }
+        let image = staticJPEG == nil ? renderer.render() : nil
+        guard staticJPEG != nil || image != nil else { continue }
         let r1 = now()
-        guard let jpeg = JPEGEncoder.encode(image, brightness: brightness, rotate: rotate) else { continue }
+        guard let jpeg = staticJPEG ?? image.flatMap({ JPEGEncoder.encode($0, brightness: brightness, rotate: rotate) })
+        else { continue }
         let r2 = now()
         do { try LYProtocol.sendFrame(device: device, jpegData: jpeg) }
         catch { print("[Bench][ERROR] send failed at frame \(sent): \(error)"); break }
@@ -573,7 +610,8 @@ private func runBenchmark() {
 
 // MARK: - GIF Mode (animated demo for the README)
 
-/// Render an animated GIF of the demo dashboard. No LCD required — pure rendering.
+/// Render an animated GIF of the dashboard. No LCD required — pure rendering.
+/// For a showcase, point it at canned data: `-magpieURL file:///path/to/dir`.
 /// Usage: --gif out.gif [--frames N] [--fps F] [--scale S]
 private func runGif() {
     let args = CommandLine.arguments
@@ -587,8 +625,7 @@ private func runGif() {
     let outW = Layout.width / scale, outH = Layout.height / scale
     let delay = 1.0 / Double(fps)
 
-    let renderer = MonitorRenderer()
-    renderer.demoMode = true
+    let renderer = primedRenderer()
 
     let url = URL(fileURLWithPath: path) as CFURL
     guard let dest = CGImageDestinationCreateWithURL(url, "com.compuserve.gif" as CFString,
@@ -629,46 +666,13 @@ private func downscaleImage(_ image: CGImage, _ w: Int, _ h: Int) -> CGImage? {
     return ctx.makeImage()
 }
 
-// MARK: - Demo Mode (showcase fake data on the LCD)
-
-/// Drive the LCD with polished demo data at 15fps — for photos and the README.
-/// Stop the running MacTR first (it holds the device); Ctrl+C to end the demo.
-private func runDemo() {
-    let brightness = parseFlag(CommandLine.arguments, flag: "-b") ?? 5
-    let rotate = CommandLine.arguments.contains("--rotate")
-
-    log("[Demo] Showcase mode — fake data")
-    let device = USBDevice()
-    do { try device.open() } catch {
-        print("[Demo][ERROR] open failed: \(error) — stop the running MacTR first")
-        return
-    }
-    defer { device.close() }
-    do { _ = try LYProtocol.handshake(device: device) }
-    catch { print("[Demo][ERROR] handshake failed: \(error)"); return }
-
-    let renderer = MonitorRenderer()
-    renderer.demoMode = true                 // fake data; no real metrics needed
-    print("[Demo] Sending demo frames at 15fps (Ctrl+C to stop)...")
-    signal(SIGINT, SIG_DFL)
-    while true {
-        autoreleasepool {
-            if let image = renderer.render(),
-               let jpeg = JPEGEncoder.encode(image, brightness: brightness, rotate: rotate) {
-                try? LYProtocol.sendFrame(device: device, jpegData: jpeg)
-            }
-        }
-        Thread.sleep(forTimeInterval: 1.0 / 15.0)
-    }
-}
-
 private func runCLI() {
     let args = CommandLine.arguments
     let isTest = args.contains("--test")
     let brightness = parseFlag(args, flag: "-b") ?? 5
     let rotate = args.contains("--rotate")
 
-    log("[*] MacTR CLI — \(isTest ? "USB Test" : "System Monitor")")
+    log("[*] MacTR CLI — \(isTest ? "USB Test" : "magpie dashboard")")
     log("[*] Brightness: level \(brightness) (\(Brightness.factor(for: brightness))x), Rotate: \(rotate)")
     log("[*] Searching for Thermalright LCD...")
 
@@ -699,9 +703,7 @@ private func runCLI() {
         log("[*] JPEG size: \(jpeg.count) bytes")
         cliFrameLoop(device: device, staticJPEG: jpeg)
     } else {
-        let renderer = MonitorRenderer()
-        renderer.startMetrics()
-        Thread.sleep(forTimeInterval: 0.3)
+        let renderer = primedRenderer()
 
         log("[*] Sending frames (press Ctrl+C to stop)...")
         signal(SIGINT, SIG_DFL)
@@ -745,6 +747,14 @@ private func cliFrameLoop(device: USBDevice, staticJPEG: Data) {
         }
         Thread.sleep(forTimeInterval: 0.5)
     }
+}
+
+/// A renderer whose first gateway poll has landed, so render() returns frames.
+private func primedRenderer() -> MagpieRenderer {
+    let renderer = MagpieRenderer()
+    renderer.startMetrics()
+    for _ in 0..<50 where renderer.render() == nil { Thread.sleep(forTimeInterval: 0.1) }
+    return renderer
 }
 
 private func parseFlag(_ args: [String], flag: String) -> Int? {
@@ -802,4 +812,38 @@ func makeTestJPEG(width: Int, height: Int) -> Data? {
 
     guard let image = ctx.makeImage() else { return nil }
     return JPEGEncoder.encode(image)
+}
+
+// MARK: - Pipeline benchmark
+
+private func runPipelineBench() {
+    let args = CommandLine.arguments
+    let level = parseFlag(args, flag: "--brightness") ?? 5
+    let renderer = primedRenderer()
+    func cpu() -> (user: Double, sys: Double) {
+        var u = rusage()
+        getrusage(RUSAGE_SELF, &u)
+        return (Double(u.ru_utime.tv_sec) + Double(u.ru_utime.tv_usec) / 1e6,
+                Double(u.ru_stime.tv_sec) + Double(u.ru_stime.tv_usec) / 1e6)
+    }
+    let frames = 150
+    var renderT = 0.0, encodeT = 0.0
+    let c0 = cpu()
+    for _ in 0..<frames {
+        autoreleasepool {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            guard let img = renderer.render() else { return }
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            _ = JPEGEncoder.encode(img, brightness: level, rotate: false)
+            let t2 = DispatchTime.now().uptimeNanoseconds
+            renderT += Double(t1 - t0) / 1e6
+            encodeT += Double(t2 - t1) / 1e6
+        }
+        Thread.sleep(forTimeInterval: 1.0 / 15)
+    }
+    let c1 = cpu()
+    let n = Double(frames)
+    print(String(format: "wall: render %.2f ms  encode %.2f ms per frame", renderT / n, encodeT / n))
+    print(String(format: "cpu:  user %.2f ms  sys %.2f ms per frame (incl. collector threads)",
+                 (c1.user - c0.user) * 1000 / n, (c1.sys - c0.sys) * 1000 / n))
 }

@@ -140,13 +140,15 @@ final class USBDevice: @unchecked Sendable {
 
     // MARK: - Transfers
 
-    func bulkWrite(_ data: Data, timeout: UInt32 = 5000) throws -> Int {
+    /// Write `count` bytes of `data` (all of it by default).
+    func bulkWrite(_ data: Data, count: Int? = nil, timeout: UInt32 = 5000) throws -> Int {
+        let length = min(count ?? data.count, data.count)
         var transferred: Int32 = 0
         let result = data.withUnsafeBytes { ptr in
             let mutable = UnsafeMutablePointer(
                 mutating: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self))
             return libusb_bulk_transfer(
-                handle, epOut, mutable, Int32(data.count),
+                handle, epOut, mutable, Int32(length),
                 &transferred, timeout)
         }
         guard result == LIBUSB_SUCCESS.rawValue else {

@@ -1,56 +1,89 @@
-# MacTR — AI Agent & System Monitor for Thermalright LCD
+# MacTR — magpie Routing Dashboard for Thermalright LCD
 
 [中文](README.md) · [English](README.en.md)
 
-Turn the 1920×480 LCD on your Thermalright CPU cooler into a live dashboard that shows
-your Mac's vitals **and what your AI coding agents are doing right now** — all native on
-macOS, no Windows required.
+Turn the 1920×480 LCD on your Thermalright CPU cooler into a live dashboard for your
+[magpie](https://usemagpie.ai) gateway: **how much of every subscription is left** on the
+left, **how each request is being routed right now** on the right — all native on macOS,
+no Windows required.
 
 ![On real hardware](img/photo.jpg)
 
-<sub>Running on a Thermalright Trofeo Vision 9.16 cooler.</sub>
+<sub>Running on a Thermalright Trofeo Vision 9.16 cooler (earlier UI).</sub>
 
 ![Dashboard](img/dashboard.gif)
 
-<sub>Live demo (fake data). Both agents "working" → columns breathe, Bongo Cat types,
-Pikachu hops and crackles with CPU load, clock ticks.</sub>
+<sub>Live demo (anonymized demo data). One card per subscription type on the left; on the
+right a magpie carries a Claude Code request to the group's first member, flies back to
+magpie on a 429 to have it handed on, and another magpie brings the answer home.</sub>
 
-> Fork of [beret21/MacTR](https://github.com/beret21/MacTR), reworked around a central
-> **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code),
-> [Codex](https://openai.com/codex) and [Cursor](https://cursor.com) sessions in real time.
-> Either column can be remapped in Settings.
+> Fork of [beret21/MacTR](https://github.com/beret21/MacTR). Everything on screen comes from
+> the gateway's `/v1/magpie/trace` and `/v1/magpie/quotas` endpoints.
 
 ## Highlights
 
-### 🤖 AI Agents panel
-Reads your **local** Claude Code / Codex / Cursor session logs (read-only, no network).
-Defaults to Cursor on the left and Codex on the right; remap either column to Claude,
-Codex or Cursor from the menu bar or **Settings → Agents**:
+### 🔀 Routing (right)
+- **agent → magpie → routing-group members**, the same structure as magpie's own routing
+  view; each recently active agent (Claude Code, T3 Code, Codex…) gets a node.
+- **Magpies carry each request** (ported from magpie's own routing page) — one flies the
+  request from the agent through magpie to the member routing picked and lets it go there,
+  the dot resting at its card while it answers; another brings the answer (a ringed dot) back. On a
+  failure the member shakes and wears a red tag (e.g. `429 · 限流`), and the magpie only
+  flies back to magpie, which hands the request on to the next member.
+- **Routing-group motion** — wires in the agent's colour, flowing while live; magpie's card
+  swells and its logo flaps and flicks its tail as a request passes; member cards are one line each —
+  account (masked), model and a short status (回答中 / 已回答 / used % / when it is back),
+  white-edged when answering or answered, dashed while resting, dotted when set aside; the
+  cards themselves carry no loading animation.
+- **Every client animates at once**: each request under way (or whose magpies are still flying) is
+  drawn together — its agent card lit and its wire flowing, a magpie in its colour flying its own
+  group's way; the magpie card names the latest request's group.
+- **Routing groups always drawn**: each recent agent's latest request is on the stage at once, each
+  routing group under a heading row (name · model · routing) with its members hung below; only the
+  focused request's group is lit. A request still being masked or routed stands on the group its
+  model went to last. Members the group leaves out (switched off, used up and not to spend credits,
+  at their cap) aren't shown; when rows overflow, account folds shut first, then other requests' groups.
+- Members not tried show **used %**; three or more accounts of one provider and model fold
+  under one heading; the hub shows the routing strategy
+  (in order / direct …).
+- The **time and date** sit in the top-right corner (e.g. `11月2日 周一 23:08`), and left of them the
+  gateway's **usage today**: `今日 99.18M tokens · $113` (tokens = input + output + cache
+  reads + cache writes; cost in USD, `+` when some requests had no price).
+- A request not yet routed (magpie still masking it, or not done picking) holds the members' column
+  with **placeholder rows** a light sweeps across, and a line saying why; one nothing took leaves
+  them still, its reason in red.
 
-- **Current project** and the **last thing it said** — Markdown tables in the message are
-  rendered as real aligned tables, not raw `| … |` text.
-- **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
-  Codex `update_plan` and Claude / Cursor `TodoWrite`. Stale plans from a finished turn disappear.
-- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Cursor's local
-  logs don't include usage, so that column shows "—").
-- **Codex remaining quota** — % left + reset countdown, tracked across all recent sessions.
-- **Live status** — the column **breathes** while an agent is working and **flashes** for
-  ~10 s when it finishes a turn or needs your input.
+### 📊 Subscription usage (left)
+- **One card per subscription type** (Claude Code, Codex, Grok …); with several accounts
+  of a type, only the one **in use right now** is shown — judged by last served time,
+  usage seen rising, then 5-hour-window usage.
+- **Two circles**: the short window (5 hours) on the left, the long one (7 days / month)
+  on the right; a missing one shows as an empty ring.
+- **Each circle is a pair of concentric rings**: usage outside (green → orange → red), and
+  a thin line inside for how far the current period has run — outer ahead of inner
+  means you're burning faster than the period.
+- An account seen both locally and through a relay gateway is merged, keeping the healthy
+  copy; accounts whose sign-in expired are listed last.
 
-### 🖥️ System panels
-- **CPU** — usage arc gauge, per-core P/E bars, temperature (via IOHIDEventSystemClient,
-  no sudo), load average.
-- **Memory** — pressure-colored usage gauge, Active/Wired/Compressed/Available breakdown,
-  a full-width clock, date, uptime and process count.
-
-### 🐱⚡ Desk pets that react to activity
-- A **Bongo Cat** taps its keyboard while your agents work (and dozes when idle).
-- A **Pikachu** whose electricity crackles harder as CPU load rises, and who hops and
-  turns while an agent is running.
+### 🔌 Switching gateways
+- **Settings → magpie**: gateway address and API key, with **Test connection** before you
+  save; the LCD switches within about a second.
+- Defaults to the local gateway `http://127.0.0.1:3425` (no key needed). A remote
+  gateway's key is sent as `Authorization: Bearer` and stored in the login Keychain.
+- **Routing from a remote gateway needs its web key**: magpie answers 403 to the trace for
+  any gateway key. Give the `magpie web` key instead (the `k=` in its sign-in link, i.e.
+  `MAGPIE_WEB_KEY`) and MacTR signs in like the page does and reads `/api/gateway/trace` and
+  `/api/usage/quotas`. The key type is detected; with a gateway key only usage is shown.
+- The trace is fetched in full once, then incrementally via `?after=<seq>` — a few KB/s.
 
 ### ⚙️ Under the hood
-- **Adaptive frame rate** — the LCD runs at ~15 fps only while something is animating
-  (agent working, heavy CPU); otherwise it idles at 2 fps to save power.
+- **Adaptive frame rate** — 20 fps while a magpie flies (a wing beat is 0.42 s), 10 fps
+  while a request waits for its answer; otherwise the configured interval (2 fps by default).
+- **CPU-frugal rendering** — the base layer (background, cards, text) is redrawn at most
+  once a second and each frame only paints what moves; rotation and brightness use vImage
+  (SIMD), and each frame goes out as a single USB transfer.
+- **Night blanking** — 18:30–09:00 the LCD goes dark and the dashboard shows in a Mac
+  window instead; can be turned off from the menu bar.
 - **USB hotplug** — auto-reconnect on plug/unplug and sleep/wake.
 - **On-Mac preview** — when no LCD is connected it renders to a window instead, so you can
   develop and see changes without the hardware.
@@ -64,6 +97,7 @@ Codex or Cursor from the menu bar or **Settings → Agents**:
 | **Display** | 9.16" IPS, 1920 × 480 |
 | **Connection** | USB Type-C (USB 2.0) |
 | **Device** | `0416:5408` (LY Bulk protocol) |
+| **Max frame rate** | ~26 fps on the newer revision, ~19 fps on the original (`--benchmark --static`) |
 
 ## Requirements
 
@@ -143,51 +177,51 @@ Pick one or the other — enabling both starts two instances that fight over the
 ```bash
 .build/release/MacTR                 # menu-bar app (LCD, or preview window if no LCD)
 .build/release/MacTR --preview       # force the on-Mac preview window
-.build/release/MacTR --demo          # drive the LCD with polished fake data (for photos)
-.build/release/MacTR --snapshot x.png --cores 10   # render one demo frame to a PNG
-.build/release/MacTR --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
-.build/release/MacTR --benchmark 120 # measure achievable LCD frame rate
+.build/release/MacTR --snapshot x.png              # render one frame to a PNG
+.build/release/MacTR --snapshot x.jpg --rotate     # the exact JPEG the LCD receives
+.build/release/MacTR --gif x.gif --frames 40 --fps 10 --scale 2   # animated demo GIF
+.build/release/MacTR --benchmark 120 [--static]    # LCD frame rate (--static: device + USB only)
+.build/release/MacTR --pipeline-bench              # CPU cost of render + encode per frame
+# Frames are JPEG-encoded on Apple silicon's hardware by default (Settings → Display → Encoding);
+# add --sw-jpeg / --hw-jpeg to any of these to pick the encoder for one run
+.build/release/MacTR --cli                         # drive the LCD headless
 ```
 
 For an installed copy the same entry point is
 `/Applications/MacTR AI.app/Contents/MacOS/MacTR`.
 
+Any mode can target a gateway for one run with `-magpieURL http://host:port`;
+`-magpieURL file:///some/dir` reads canned `v1/magpie/trace` and `v1/magpie/quotas` files
+from that directory instead (for demos and tests). The `MAGPIE_API_KEY` environment
+variable sets the key for one run without touching the Keychain.
+
 Only one process can hold the USB device at a time — stop the running instance before
-using `--demo` / `--benchmark`.
+using `--benchmark` / `--cli`.
 
-## How agent data is read
+## Data sources
 
-MacTR never talks to any network or API. It only reads local session transcripts that the
-CLIs already write to disk:
+| Endpoint | Used for |
+|---|---|
+| `GET /v1/magpie/trace` | recent requests: agent, routing group and strategy, member order, each attempt's status and timing |
+| `GET /v1/magpie/quotas` | every subscription account's usage windows, used %, reset times |
 
-| Agent | Source | What's parsed |
-|---|---|---|
-| Claude Code | `~/.claude/projects/*/*.jsonl` | assistant messages, `usage` tokens, `TodoWrite` |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
-| Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` | assistant messages, `turn_ended`, `TodoWrite` (no token usage) |
-
-Token totals are scoped to the local day; the panel gracefully shows the last session's
-context when an agent hasn't run yet today.
+The trace is polled every second (incrementally); quotas refresh every 30 seconds.
 
 ## Privacy
 
-Everything is local and read-only. No telemetry, no network calls, nothing leaves your Mac.
+MacTR only reads from the magpie gateway you configure in Settings and talks to no other
+network service. The API key lives in the login Keychain, never in the preferences file.
+No telemetry.
 
 ## Credits
 
 - [beret21/MacTR](https://github.com/beret21/MacTR) — the original macOS driver this is built on
 - [thermalright-trcc-linux](https://github.com/Lexonight1/thermalright-trcc-linux) — LY Bulk protocol reverse engineering
-- [fermion-star/apple_sensors](https://github.com/fermion-star/apple_sensors) — IOHIDEventSystemClient temperature reading
-- [kuroni/bongocat-osu](https://github.com/kuroni/bongocat-osu) — Bongo Cat sprite
-- Pikachu artwork via [PokeAPI/sprites](https://github.com/PokeAPI/sprites) — Pokémon is © Nintendo / Creatures / GAME FREAK; included here as a cosmetic homage only
-
-> The Bongo Cat and Pikachu are purely decorative. If you redistribute builds, note that
-> their artwork belongs to the respective owners — swap or remove the embedded
-> `BongoCatAsset.swift` / `PikachuAsset.swift` if that matters for your use.
+- [magpie](https://usemagpie.ai) — the AI gateway that provides the routing and usage data
 
 ## License
 
-MIT (inherited from the upstream project). Third-party assets remain under their own terms.
+MIT (inherited from the upstream project).
 
 ---
 

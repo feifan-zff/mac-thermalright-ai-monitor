@@ -78,6 +78,37 @@ enum Layout {
     }
 }
 
+// MARK: - Display shape
+
+/// The physical screen outline, matched from the handshake. Newer Trofeo Vision
+/// 9.16 panels (PM 69) have rounded corners that clip anything drawn square into
+/// them; the original revision is square. The last seen PM is remembered so the
+/// on-Mac preview matches the screen while it's unplugged.
+enum DisplayShape {
+    private static let pmKey = "lastDevicePM"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var radius: CGFloat =
+        cornerRadius(forPM: UserDefaults.standard.integer(forKey: pmKey))
+
+    /// Corner radius of the visible area, in frame pixels (0 = square).
+    static var cornerRadius: CGFloat {
+        lock.lock(); defer { lock.unlock() }
+        return radius
+    }
+
+    static func update(pm: Int) {
+        UserDefaults.standard.set(pm, forKey: pmKey)
+        lock.lock()
+        radius = cornerRadius(forPM: pm)
+        lock.unlock()
+    }
+
+    // Measured from a photo of a PM 69 panel: ~45–50px at 1920×480
+    private static func cornerRadius(forPM pm: Int) -> CGFloat {
+        pm == 69 ? 48 : 0
+    }
+}
+
 // MARK: - Fonts
 
 enum Fonts {
