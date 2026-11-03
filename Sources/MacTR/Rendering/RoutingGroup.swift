@@ -37,6 +37,8 @@ struct GroupRow {
     let state: State
     let low: Bool                // 90% or more of its allowance used
     var way: StageWay? = nil     // a way's heading: the way it names
+    var used: Double? = nil      // a member's: how much of the cycle that binds it is used (0…100)
+    var timed = false            // its status ends in a countdown ("6d", "限流 · 31m"): drawn heavier
 
     var isFold: Bool { kind == .fold }
     var isWay: Bool { kind == .way }
@@ -60,16 +62,16 @@ enum RoutingGroup {
     /// Every row of the stage: for each request (one a way), its way's heading
     /// when `headed`, then its members, each fold followed by its own.
     static func stage(_ routes: [MagpieRoute], headed: Bool, now: Date,
-                      mask: (String) -> String) -> [GroupRow] {
+                      mask: (String) -> String, cycles: (MagpieMember) -> [Cycle] = { _ in [] }) -> [GroupRow] {
         var out: [GroupRow] = []
         for r in routes {
             let w = way(r)
             guard headed else {
-                out += rows(r, now: now, mask: mask, prefix: w.key + ">", parent: nil, depth: 0)
+                out += rows(r, now: now, mask: mask, cycles: cycles, prefix: w.key + ">", parent: nil, depth: 0)
                 continue
             }
             let head = "way:" + w.key
-            let kids = rows(r, now: now, mask: mask, prefix: w.key + ">", parent: head, depth: 1)
+            let kids = rows(r, now: now, mask: mask, cycles: cycles, prefix: w.key + ">", parent: head, depth: 1)
             guard let first = r.members.first else { continue }
             out.append(heading(head, w, first, r, kids.filter { $0.parent == head }, mask: mask))
             out += kids
@@ -99,6 +101,7 @@ enum RoutingGroup {
     /// The rows of one request's members, each fold followed by its own:
     /// ids start `prefix`, top rows hang under `parent` set in `depth`.
     static func rows(_ r: MagpieRoute, now: Date, mask: (String) -> String,
+                     cycles: (MagpieMember) -> [Cycle] = { _ in [] },
                      prefix: String = "", parent: String? = nil, depth: Int = 0) -> [GroupRow] {
         let f = Findings(r, now: now)
         let seats = seated(r)
@@ -106,9 +109,13 @@ enum RoutingGroup {
         var run: [MagpieMember] = []
 
         func row(_ w: MagpieMember, parent: String?, depth: Int) -> GroupRow {
-            let (status, state, low) = say(w, r, f, now: now)
-            return GroupRow(kind: .member, id: prefix + w.id, member: w, members: [], parent: parent, depth: depth,
-                            status: status, openStatus: status, state: state, low: low)
+            let cycle = binding(cycles(w))
+            let (status, state, low) = say(w, r, f, now: now, cycle: cycle)
+            var g = GroupRow(kind: .member, id: prefix + seat(w), member: w, members: [], parent: parent, depth: depth,
+                             status: status, openStatus: status, state: state, low: low)
+            if w.known { g.used = cycle?.used ?? w.usedPercent }
+            g.timed = status.range(of: #"(^|· )\d+[mhd]$"#, options: .regularExpression) != nil
+            return g
         }
         func flush() {
             defer { run = [] }
@@ -116,7 +123,7 @@ enum RoutingGroup {
                 out += run.map { row($0, parent: parent, depth: depth) }
                 return
             }
-            let key = prefix + "fold:" + first.id
+            let key = prefix + "fold:" + seat(first)
             let kids = run.map { row($0, parent: key, depth: depth + 1) }
             out.append(together(key, first, kids, parent: parent, depth: depth))
             out += kids
@@ -174,13 +181,14 @@ enum RoutingGroup {
         var answered: Set<String> = [], trying: Set<String> = []
         var gave: [String: MagpieTry] = [:], went: [String: MagpieTry] = [:]
         var rests: [String: MagpieRest] = [:]
+        var served: [String: String] = [:]   // what answered, by member
 
         init(_ r: MagpieRoute, now: Date) {
             for w in r.members { if let rest = w.rest { rests[w.id] = rest } }
             for (i, t) in r.tries.enumerated() {
                 let last = i == r.tries.count - 1
                 if !t.done { trying.insert(t.id) }
-                else if !t.failed { answered.insert(t.id) }
+                else if !t.failed { answered.insert(t.id); served[t.id] = t.served }
                 else if t.rest == nil && !t.again && !t.earlier && r.done && last { gave[t.id] = t }
                 else if t.rest == nil && !t.again && !t.credits && !last { went[t.id] = t }
                 if let rest = t.rest { rests[t.id] = rest }
@@ -189,23 +197,32 @@ enum RoutingGroup {
         }
     }
 
-    private static func say(_ w: MagpieMember, _ r: MagpieRoute, _ f: Findings, now: Date) -> (String, GroupRow.State, Bool) {
+    private static func say(_ w: MagpieMember, _ r: MagpieRoute, _ f: Findings, now: Date,
+                            cycle: Cycle?) -> (String, GroupRow.State, Bool) {
         // The panel's rows are one line each: the page's words, cut to the gist
         let rest = f.rests[w.id], resting = rest.map { $0.until > now } ?? false
         let s: String
-        if w.unlisted { s = unlistedWord(w) }
+        if w.unlisted { s = unlistedWord(w, cycle: cycle, now: now) }
         else if resting, let rest { s = restSay(rest, now: now) }
         else if w.window != nil { s = "超出上下文" }
         else if f.trying.contains(w.id) { s = "回答中" }
-        else if f.answered.contains(w.id) { s = "已回答" }
-        else if let t = f.gave[w.id] ?? f.went[w.id] {
-            s = (t.status.flatMap { $0 > 0 ? "\($0) " : nil } ?? "") + failWord(t.fail)
+        else if f.answered.contains(w.id) {
+            // A remote magpie (a provider, not an account) hides who is behind it:
+            // the model it served says it
+            s = w.kind == "provider" ? f.served[w.id] ?? "已回答" : "已回答"
         }
-        else if w.known, let used = w.usedPercent {
-            let n = "已用 \(Int(used.rounded()))%"
-            if w.creditsLast && !(r.members.first?.creditsLast ?? false) { s = n + " · 用积分" }
-            else if w.routing.isEmpty && used >= 98 { s = n + " · 几乎用尽" }
-            else { s = n }
+        else if let t = f.gave[w.id] ?? f.went[w.id] {
+            // a quota failure has no word (the bar says it): its renewal says when it is back
+            let said = (t.status.flatMap { $0 > 0 ? "\($0) " : nil } ?? "") + failWord(t.fail)
+            s = said.isEmpty ? (cycle?.renews ?? w.renews ?? w.due).map { renewWord($0, now: now) } ?? "" : said
+        }
+        else if w.known, w.usedPercent != nil {
+            // How much is used is the bar along the row's foot; the words say
+            // what it can't — when the window renews, and what happens at its end
+            var parts: [String] = []
+            if let at = cycle?.renews ?? w.renews ?? w.due { parts.append(renewWord(at, now: now)) }
+            if w.creditsLast && !(r.members.first?.creditsLast ?? false) { parts.append("用积分") }
+            s = parts.joined(separator: " · ")
         }
         else { s = "" }
 
@@ -216,7 +233,7 @@ enum RoutingGroup {
             : (resting || f.gave[w.id] != nil) ? .rest
             : (w.unlisted || w.window != nil) ? .left
             : .idle
-        let low = w.routing.isEmpty && w.known && (w.usedPercent ?? 0) >= 90
+        let low = w.routing.isEmpty && w.known && (cycle?.used ?? w.usedPercent ?? 0) >= 90
         return (s, state, low)
     }
 
@@ -249,57 +266,53 @@ enum RoutingGroup {
         w.kind == "provider" ? w.name : (w.who.map(mask) ?? w.name)
     }
 
-    private static func unlistedWord(_ w: MagpieMember) -> String {
+    /// One billing cycle of an account: how much of it is used (0…100) and when
+    /// it renews.
+    typealias Cycle = (used: Double, renews: Date?)
+
+    /// The cycle that binds an account. A request needs room in all of its cycles
+    /// (an AND), so what matters is the one that has none: with several used up
+    /// the account is back only when the last of them renews; with none, the
+    /// one most used — the nearer renewal when they tie.
+    static func binding(_ cycles: [Cycle]) -> Cycle? {
+        let spent = cycles.filter { $0.used >= 99.5 }
+        if !spent.isEmpty { return spent.max { ($0.renews ?? .distantPast) < ($1.renews ?? .distantPast) } }
+        return cycles.max { a, b in
+            a.used != b.used ? a.used < b.used : (a.renews ?? .distantFuture) > (b.renews ?? .distantFuture)
+        }
+    }
+
+    /// How long until a usage window renews, bare for a row's narrow end:
+    /// "42m", "3h", "6d".
+    private static func renewWord(_ at: Date, now: Date) -> String {
+        let m = max(1, Int((at.timeIntervalSince(now) / 60).rounded()))
+        return m < 60 ? "\(m)m"
+            : m < 48 * 60 ? "\(Int((Double(m) / 60).rounded()))h"
+            : "\(Int((Double(m) / 1440).rounded()))d"
+    }
+
+    private static func unlistedWord(_ w: MagpieMember, cycle: Cycle?, now: Date) -> String {
         if w.held { return "此 Key 不可用" }
-        if w.noCredits { return "额度用尽 · 不用积分" }
+        if w.noCredits {   // used up: the bar says it, the words say when it renews
+            return (cycle?.renews ?? w.renews ?? w.due).map { renewWord($0, now: now) } ?? "暂不使用"
+        }
         if let cap = w.capped { return "已达 \(cap)% 上限" }
         if w.barred { return "只用于其他模型" }
         return "暂不使用"
     }
 
     private static let failWords = [
-        "rate": "限流", "credit": "余额不足", "quota": "额度用尽", "other": "失败", "auth": "需要登录",
+        "rate": "限流", "credit": "余额不足", "quota": "", "other": "失败", "auth": "需要登录",
         "canceled": "已取消", "verify": "需要验证", "refused": "被安全过滤拒绝", "overflow": "超出模型长度",
         "slow": "迟迟不开始", "offline": "网络断开", "proxy": "代理不可达",
     ]
 
     static func failWord(_ why: String?) -> String { why.flatMap { failWords[$0] } ?? "失败" }
 
-    /// A resting row: why, and when it is back. A failure that names no kind says its status.
+    /// A resting row: why, and how long until it is back ("限流 · 31m"). A failure that names no kind says its status.
     static func restSay(_ rest: MagpieRest, now: Date) -> String {
         let named = failWords[rest.why] != nil && rest.why != "other"
         let status = !named ? (rest.status.map { "\($0) " } ?? "") : ""
-        let left = rest.until.timeIntervalSince(now)
-        let when = left < 3600 ? "\(dur(left))后恢复" : "\(clock(rest.until, now: now)) 恢复"
-        return status + failWord(rest.why) + " · " + when
-    }
-
-    /// The page's dur: "40 秒", "12 分钟", "3 小时 42 分钟", "20 小时", "3 天".
-    static func dur(_ seconds: TimeInterval) -> String {
-        let s = max(1, Int(seconds.rounded()))
-        if s < 60 { return "\(s) 秒" }
-        let m = Int((Double(s) / 60).rounded())
-        if m < 60 { return "\(m) 分钟" }
-        let h = m / 60, mm = m % 60
-        if h < 10 && mm > 0 { return "\(h) 小时 \(mm) 分钟" }
-        if h < 48 { return "\(Int((Double(m) / 60).rounded())) 小时" }
-        return "\(Int((Double(m) / 1440).rounded())) 天"
-    }
-
-    /// "16:00" today, "周二 16:00" another day.
-    static func clock(_ d: Date, now: Date) -> String {
-        (Calendar.current.isDate(d, inSameDayAs: now) ? today : otherDay).string(from: d)
-    }
-
-    // Made once: a DateFormatter costs far more to build than to use
-    // (DateFormatter is thread-safe for formatting)
-    nonisolated(unsafe) private static let today = formatter("HH:mm")
-    nonisolated(unsafe) private static let otherDay = formatter("EEE HH:mm")
-
-    private static func formatter(_ format: String) -> DateFormatter {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = format
-        return f
+        return [status + failWord(rest.why), renewWord(rest.until, now: now)].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 }

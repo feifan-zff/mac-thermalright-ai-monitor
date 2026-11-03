@@ -26,5 +26,6 @@ let package = Package(
                 .linkedLibrary("usb-1.0"),
             ]
         ),
+        .testTarget(name: "MacTRTests", dependencies: ["MacTR"]),
     ]
 )

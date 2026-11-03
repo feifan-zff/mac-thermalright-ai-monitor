@@ -44,16 +44,39 @@ enum MagpieConfig {
         return cachedKey!
     }
 
-    static func save(url: String, apiKey key: String) {
+    struct Configuration: Sendable {
+        let generation: Int
+        let baseURL: String
+        let apiKey: String
+    }
+
+    /// URL, key and generation must describe the same committed configuration.
+    static func configuration() -> Configuration {
+        lock.lock(); defer { lock.unlock() }
+        if let override = ProcessInfo.processInfo.environment["MAGPIE_API_KEY"], !override.isEmpty {
+            return Configuration(generation: _generation, baseURL: baseURL, apiKey: override)
+        }
+        if cachedKey == nil { cachedKey = readKeychain() ?? "" }
+        return Configuration(generation: _generation, baseURL: baseURL, apiKey: cachedKey!)
+    }
+
+    struct KeychainError: LocalizedError {
+        let status: OSStatus
+        var errorDescription: String? {
+            "钥匙串保存失败（\(status)）"
+        }
+    }
+
+    static func save(url: String, apiKey key: String) throws {
         let url = normalize(url)
         let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        try writeKeychain(key)
+        lock.lock()
         if url.isEmpty || url == defaultURL {
             UserDefaults.standard.removeObject(forKey: urlKey)
         } else {
             UserDefaults.standard.set(url, forKey: urlKey)
         }
-        writeKeychain(key)
-        lock.lock()
         cachedKey = key
         _generation += 1
         lock.unlock()
@@ -86,20 +109,21 @@ enum MagpieConfig {
         return String(data: data, encoding: .utf8)
     }
 
-    private static func writeKeychain(_ key: String) {
+    private static func writeKeychain(_ key: String) throws {
         guard !key.isEmpty else {
-            SecItemDelete(baseQuery as CFDictionary)
+            let status = SecItemDelete(baseQuery as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeychainError(status: status)
+            }
             return
         }
         let data = Data(key.utf8)
-        let status = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
+        var status = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
         if status == errSecItemNotFound {
             var add = baseQuery
             add[kSecValueData] = data
-            let addStatus = SecItemAdd(add as CFDictionary, nil)
-            if addStatus != errSecSuccess { log("[Magpie] Keychain save failed: \(addStatus)") }
-        } else if status != errSecSuccess {
-            log("[Magpie] Keychain update failed: \(status)")
+            status = SecItemAdd(add as CFDictionary, nil)
         }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 }

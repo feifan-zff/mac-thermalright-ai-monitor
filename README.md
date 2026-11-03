@@ -2,7 +2,7 @@
 
 [中文](README.md) · [English](README.en.md)
 
-把利民 CPU 散热器上的 1920×480 LCD 变成 [magpie](https://usemagpie.ai) 网关的实时看板:
+把利民 CPU 散热器上的 LCD(1920×480 等多种规格)变成 [magpie](https://usemagpie.ai) 网关的实时看板:
 左边是**每个订阅账号还剩多少额度**,右边是**请求此刻怎么被路由**的动画 —— 全部原生运行于 macOS,无需 Windows。
 
 ![真机实拍](img/photo.jpg)
@@ -12,6 +12,23 @@
 ![仪表盘](img/dashboard.gif)
 
 <sub>实时演示(脱敏的演示数据)。左边每类订阅一张卡片;右边一只喜鹊把 Claude Code 的请求叼到第一个成员,遇到 429 飞回 magpie 转给下一个,答案再由另一只喜鹊送回。</sub>
+
+### 跟随屏幕自适应
+
+画面尺寸和是否翻转 180° 都取自设备握手信息,不同规格的屏幕自动重新排版,无需设置。
+下面是同一份演示数据在其他规格上的样子(由 `--snapshot --size` 渲染,与本机预览窗口是同一套渲染):
+
+**1920 × 440**(PM 69)
+
+![1920×440](img/size-1920x440.png)
+
+**1600 × 720**(FBL 114)
+
+![1600×720](img/size-1600x720.png)
+
+**1280 × 480**(PM 68)
+
+![1280×480](img/size-1280x480.png)
 
 > 基于 [beret21/MacTR](https://github.com/beret21/MacTR) 改造,显示内容来自 magpie 网关的
 > `/v1/magpie/trace` 与 `/v1/magpie/quotas` 接口。
@@ -43,7 +60,7 @@
 ### ⚙️ 底层
 - **自适应帧率** —— 喜鹊飞行时 LCD 跑 20fps(扇翅一次 0.42 秒),请求等待回答时 10fps,其余时间按设置的间隔(默认 2fps)刷新。
 - **省 CPU 的渲染** —— 背景、卡片和文字组成的底层每秒最多重绘一次,每帧只画动的部分;旋转与亮度用 vImage(SIMD),整帧一次 USB 传输。
-- **夜间熄屏** —— 18:30–09:00 关掉 LCD、改在本机窗口显示,可在菜单栏关闭。
+- **按设备自适应** —— 画面尺寸和是否翻转 180° 都取自设备握手信息(1920×480、1920×440、1280×480、1600×720…),无需设置。
 - **USB 热插拔** —— 插拔、睡眠/唤醒后自动重连。
 - **本机预览** —— 没接 LCD 时改为渲染到窗口,方便无硬件开发调试。
 - **菜单栏应用** —— 后台运行,无 Dock 图标。
@@ -132,7 +149,8 @@ launchctl load -w ~/Library/LaunchAgents/com.m1ngli.MacTRAI.plist
 .build/release/MacTR                 # 菜单栏应用(有 LCD 走 LCD,没有则预览窗口)
 .build/release/MacTR --preview       # 强制打开本机预览窗口
 .build/release/MacTR --snapshot x.png              # 渲染一帧到 PNG
-.build/release/MacTR --snapshot x.jpg --rotate     # 输出设备实际收到的 JPEG(含旋转/亮度)
+.build/release/MacTR --snapshot x.jpg              # 输出设备实际收到的 JPEG(含旋转/亮度);--no-rotate 为正向
+.build/release/MacTR --snapshot x.png --size 1280x480   # 按另一种屏幕尺寸渲染
 .build/release/MacTR --gif x.gif --frames 40 --fps 10 --scale 2   # 生成演示 GIF
 .build/release/MacTR --benchmark 120 [--static]    # 测 LCD 可达帧率(--static 只测设备 + USB)
 .build/release/MacTR --pipeline-bench              # 每帧渲染 + 编码的 CPU 开销

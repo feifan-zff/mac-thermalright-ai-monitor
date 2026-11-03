@@ -12,31 +12,6 @@ extension Notification.Name {
     static let deviceStateChanged = Notification.Name("deviceStateChanged")
 }
 
-// MARK: - Night schedule
-
-/// Nightly window during which the LCD is blanked and the dashboard shows on the
-/// Mac instead. Defaults to 18:30 → 09:00 (spans midnight).
-enum NightSchedule {
-    static let startMinute = 18 * 60 + 30   // 18:30
-    static let endMinute = 9 * 60           // 09:00
-    private static let enabledKey = "nightBlankEnabled"
-
-    /// User toggle (menu bar). When off, the LCD stays live around the clock.
-    static var isEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
-    }
-
-    static var isNight: Bool {
-        guard isEnabled else { return false }
-        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
-        let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
-        return startMinute < endMinute
-            ? (m >= startMinute && m < endMinute)      // same-day window
-            : (m >= startMinute || m < endMinute)      // window spanning midnight
-    }
-}
-
 // MARK: - AppState
 
 @Observable
@@ -49,10 +24,10 @@ final class AppState {
     var statusMessage = "Disconnected"
 
     // Display
-    // Brightness / rotation persist across launches (the cooler doesn't move)
+    // Brightness persists across launches. Size and orientation aren't settings:
+    // they come from the screen's handshake (DeviceInfo).
     var brightness: Int = UserDefaults.standard.object(forKey: "brightness") as? Int ?? 5
     var refreshInterval: Double = 0.5
-    var rotateDisplay: Bool = UserDefaults.standard.bool(forKey: "rotateDisplay")
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -83,7 +58,7 @@ final class AppState {
             }
         }
         engine = eng
-        eng.start(brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        eng.start(brightness: brightness, interval: refreshInterval)
     }
 
     /// Stop for good (quit): waits out the frame being sent, so the LCD is never
@@ -106,11 +81,10 @@ final class AppState {
         frameCount = 0
     }
 
-    /// Called when user changes brightness, rotation, or interval
+    /// Called when user changes brightness or interval
     func applySettings() {
         UserDefaults.standard.set(brightness, forKey: "brightness")
-        UserDefaults.standard.set(rotateDisplay, forKey: "rotateDisplay")
-        engine?.updateSettings(brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        engine?.updateSettings(brightness: brightness, interval: refreshInterval)
     }
 
     /// Latest rendered frame for the on-Mac preview window
@@ -133,40 +107,38 @@ struct EngineStatus: Sendable {
 
 final class DisplayEngine: @unchecked Sendable {
 
-    // Cached all-black JPEG used to blank the LCD during the night window.
-    nonisolated(unsafe) private static var _blackFrame: Data?
-    static func blackFrame(rotate: Bool) -> Data? {
-        if let f = _blackFrame { return f }
-        let w = Layout.width, h = Layout.height
-        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
-                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        guard let img = ctx.makeImage() else { return nil }
-        _blackFrame = JPEGEncoder.encode(img, brightness: 1, rotate: rotate)
-        return _blackFrame
-    }
-
     private let statusCallback: @Sendable (EngineStatus) -> Void
     private let usbQueue = DispatchQueue(label: "com.thermalvision.usb")
     private var device: USBDevice?
     private var hotplug: USBHotplug?
-    private var running = false
+    // Stop can arrive on the main/hotplug thread while USB is opening or sending.
+    private let stateLock = NSLock()
+    private var _running = false
+    private var _quitting = false
+    private var connectionGeneration = 0
+    private var running: Bool {
+        get { stateLock.withLock { _running } }
+        set { stateLock.withLock { _running = newValue } }
+    }
     private var frameCount = 0
     private var lastFrameSize = 0
     private var fpsFrames = 0
     private var fpsSince = Date()
     private let frameWake = DispatchSemaphore(value: 0)   // the frame loop's sleep, cut short by stop()
-    private var quitting = false
     // The last frame encoded, and what it was encoded with (usbQueue only)
-    private var lastEncoded: (image: CGImage, brightness: Int, rotate: Bool, jpeg: Data)?
+    private var lastEncoded: (image: CGImage, brightness: Int, rotate180: Bool, hardware: Bool, jpeg: Data)?
 
-    // Settings (atomically accessed)
-    private var brightness: Int = 5
-    private var interval: Double = 0.5
-    private var rotateDisplay: Bool = false
+    // Settings share the lifecycle lock because the UI writes while USB reads.
+    private var _brightness: Int = 5
+    private var _interval: Double = 0.5
+    private var brightness: Int {
+        get { stateLock.withLock { _brightness } }
+        set { stateLock.withLock { _brightness = newValue } }
+    }
+    private var interval: Double {
+        get { stateLock.withLock { _interval } }
+        set { stateLock.withLock { _interval = newValue } }
+    }
 
     private let renderer = MagpieRenderer()
 
@@ -174,10 +146,9 @@ final class DisplayEngine: @unchecked Sendable {
         self.statusCallback = statusCallback
     }
 
-    func start(brightness: Int, interval: Double, rotate: Bool) {
+    func start(brightness: Int, interval: Double) {
         self.brightness = brightness
         self.interval = interval
-        self.rotateDisplay = rotate
 
         usbQueue.async { [weak self] in
             guard let self else { return }
@@ -187,9 +158,20 @@ final class DisplayEngine: @unchecked Sendable {
         }
     }
 
+    /// Invalidate a pending handshake/retry as well as the active frame loop.
+    @discardableResult
+    private func interruptConnection() -> Int {
+        let generation = stateLock.withLock {
+            _running = false
+            connectionGeneration += 1
+            return connectionGeneration
+        }
+        frameWake.signal()
+        return generation
+    }
+
     func stop() {
-        running = false
-        frameWake.signal()   // cut the frame loop's sleep short
+        interruptConnection()
         renderer.stopMetrics()
         usbQueue.async { [weak self] in
             self?.hotplug?.stop()
@@ -204,14 +186,20 @@ final class DisplayEngine: @unchecked Sendable {
     /// frame: it ignores everything after (even a handshake) until it is
     /// unplugged, so quitting must never cut a frame short.
     func stopAndWait() {
-        quitting = true   // no reconnect (a send error's retry) once we're on the way out
+        stateLock.withLock { _quitting = true }
         stop()
         usbQueue.sync {}
     }
 
-    func reconnect() {
-        usbQueue.async { [weak self] in
-            self?.connectAndRun()
+    func reconnect(after delay: TimeInterval = 0) {
+        let generation = interruptConnection()
+        scheduleConnection(after: delay, generation: generation)
+    }
+
+    private func scheduleConnection(after delay: TimeInterval, generation: Int) {
+        usbQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.connectAndRun(expectedGeneration: generation)
         }
     }
 
@@ -221,17 +209,21 @@ final class DisplayEngine: @unchecked Sendable {
         renderer.render()
     }
 
-    func updateSettings(brightness: Int, interval: Double, rotate: Bool) {
-        log("[Engine] Settings updated: brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
+    func updateSettings(brightness: Int, interval: Double) {
+        log("[Engine] Settings updated: brightness=\(brightness), interval=\(interval)")
         self.brightness = brightness
         self.interval = interval
-        self.rotateDisplay = rotate
     }
 
     // MARK: - Private (all on usbQueue)
 
-    private func connectAndRun() {
-        guard !running, !quitting else { return }
+    private func connectAndRun(expectedGeneration: Int? = nil) {
+        let generation: Int? = stateLock.withLock {
+            guard !_running, !_quitting,
+                  expectedGeneration == nil || expectedGeneration == connectionGeneration else { return nil }
+            return connectionGeneration
+        }
+        guard let generation else { return }
 
         // Ensure gateway polling is running (may have been stopped on disconnect/sleep)
         renderer.startMetrics()
@@ -259,58 +251,61 @@ final class DisplayEngine: @unchecked Sendable {
 
         do {
             let info = try LYProtocol.handshake(device: dev)
+            let mayRun = stateLock.withLock {
+                guard !_quitting, connectionGeneration == generation else { return false }
+                _running = true
+                return true
+            }
+            guard mayRun else { dev.close(); return }
             DisplayShape.update(pm: info.pm)
-            log("[*] Device PM=\(info.pm) SUB=\(info.sub) FBL=\(info.fbl) → corner radius \(Int(DisplayShape.cornerRadius))px")
+            renderer.adaptCanvas(width: info.width, height: info.height)
+            log("[*] Device PM=\(info.pm) SUB=\(info.sub) FBL=\(info.fbl) → \(info.width)x\(info.height), "
+                + "rotate 180°: \(info.needsRotation), corner radius \(Int(DisplayShape.cornerRadius))px")
             device = dev
             postStatus(connected: true, deviceInfo: info,
                        message: "Connected (\(info.width)x\(info.height))")
-            runFrameLoop(device: dev, info: info)
+            runFrameLoop(device: dev, info: info, generation: generation)
         } catch {
             dev.close()
             postStatus(connected: false, message: "Handshake failed")
         }
     }
 
-    private func runFrameLoop(device: USBDevice, info: DeviceInfo) {
-        running = true
+    private func runFrameLoop(device: USBDevice, info: DeviceInfo, generation: Int) {
         // Metrics already collecting in background via startMetrics()
 
         var nextDeadline = DispatchTime.now()
 
         while running {
-            // Night window (18:30–09:00): blank the LCD; the dashboard shows on the
-            // Mac preview instead. Refresh the black frame slowly to save power.
-            let night = NightSchedule.isNight
-
             // Adaptive frame rate: the device sustains ~26fps (~19 on the original
             // revision), but the routing panel only moves while a request is
             // played. 20fps while a magpie flies (a wing beat is .42s), 10fps
             // while a request only waits — every frame is a full JPEG encode +
             // USB transfer — otherwise idle at the configured interval to save
             // CPU/power on this always-on app.
-            let fps = night ? nil : renderer.preferredFrameRate()
-            let frameInterval = night ? 3.0 : (fps.map { 1.0 / $0 } ?? interval)
+            let fps = renderer.preferredFrameRate()
+            let frameInterval = fps.map { 1.0 / $0 } ?? interval
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
             autoreleasepool {
                 let bright = brightness
-                let rotate = rotateDisplay
+                let rotate180 = info.needsRotation   // how this screen is mounted
 
                 let jpeg: Data?
 
-                if night {
-                    jpeg = DisplayEngine.blackFrame(rotate: rotate)
-                } else if let image = renderer.render() {
+                if let image = renderer.render() {
                     // Idle, the renderer hands back the same image until something
                     // changes: send the JPEG already made of it (an encode is most
                     // of a frame's cost)
-                    if let last = lastEncoded, last.image === image, last.brightness == bright, last.rotate == rotate {
+                    let hardware = JPEGEncoder.useHardware
+                    if let last = lastEncoded, last.image === image, last.brightness == bright,
+                       last.rotate180 == rotate180, last.hardware == hardware {
                         jpeg = last.jpeg
                     } else {
-                        jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
-                        lastEncoded = jpeg.map { (image, bright, rotate, $0) }
+                        jpeg = JPEGEncoder.encode(image, brightness: bright, rotate180: rotate180)
+                        lastEncoded = jpeg.map { (image, bright, rotate180, hardware, $0) }
                     }
                 } else {
                     jpeg = nil
@@ -342,8 +337,8 @@ final class DisplayEngine: @unchecked Sendable {
                         postStatus(connected: false, message: "Disconnected (send error)")
 
                         log("[Engine] Will retry connection in 5s...")
-                        Thread.sleep(forTimeInterval: 5)
-                        connectAndRun()
+                        // Unwind this frame and its autoreleasepool before retrying.
+                        scheduleConnection(after: 5, generation: generation)
                         return
                     }
                 }
@@ -366,18 +361,14 @@ final class DisplayEngine: @unchecked Sendable {
 
         hp.onConnect = { [weak self] in
             guard let self else { return }
-            self.usbQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, !self.running else { return }
-                log("[Hotplug] Attempting reconnect...")
-                self.renderer.startMetrics()
-                self.connectAndRun()
-            }
+            let generation = self.stateLock.withLock { self.connectionGeneration }
+            self.scheduleConnection(after: 1, generation: generation)
         }
 
         hp.onDisconnect = { [weak self] in
             guard let self else { return }
             log("[Hotplug] Device removed")
-            self.running = false
+            self.interruptConnection()
             // Metrics keep collecting — the on-Mac preview window takes over
             // rendering while the LCD is away
             self.usbQueue.async { [weak self] in
@@ -399,24 +390,16 @@ final class DisplayEngine: @unchecked Sendable {
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 log("[Wake] macOS woke from sleep — reconnecting in 3s...")
-                self.usbQueue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                    guard let self else { return }
-                    self.running = false
-                    self.device?.close()
-                    self.device = nil
-                    log("[Wake] Attempting reconnect...")
-                    self.connectAndRun()
-                }
+                // Interrupt before enqueueing: the active loop owns usbQueue.
+                self.reconnect(after: 3)
             }
 
             center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 if !self.running {
                     log("[Wake] Screens woke — reconnecting in 2s...")
-                    self.usbQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self, !self.running else { return }
-                        self.connectAndRun()
-                    }
+                    let generation = self.stateLock.withLock { self.connectionGeneration }
+                    self.scheduleConnection(after: 2, generation: generation)
                 }
             }
         }

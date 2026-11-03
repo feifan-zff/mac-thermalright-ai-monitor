@@ -2,7 +2,7 @@
 
 [中文](README.md) · [English](README.en.md)
 
-Turn the 1920×480 LCD on your Thermalright CPU cooler into a live dashboard for your
+Turn the LCD on your Thermalright CPU cooler (1920×480 and other sizes) into a live dashboard for your
 [magpie](https://usemagpie.ai) gateway: **how much of every subscription is left** on the
 left, **how each request is being routed right now** on the right — all native on macOS,
 no Windows required.
@@ -16,6 +16,24 @@ no Windows required.
 <sub>Live demo (anonymized demo data). One card per subscription type on the left; on the
 right a magpie carries a Claude Code request to the group's first member, flies back to
 magpie on a 429 to have it handed on, and another magpie brings the answer home.</sub>
+
+### Fits the screen
+
+The frame size and whether it is turned 180° both come from the device's handshake, so
+each screen is laid out for itself with nothing to configure. The same demo data on the
+other sizes (rendered by `--snapshot --size`, the same renderer as the on-Mac preview):
+
+**1920 × 440** (PM 69)
+
+![1920×440](img/size-1920x440.png)
+
+**1600 × 720** (FBL 114)
+
+![1600×720](img/size-1600x720.png)
+
+**1280 × 480** (PM 68)
+
+![1280×480](img/size-1280x480.png)
 
 > Fork of [beret21/MacTR](https://github.com/beret21/MacTR). Everything on screen comes from
 > the gateway's `/v1/magpie/trace` and `/v1/magpie/quotas` endpoints.
@@ -82,8 +100,8 @@ magpie on a 429 to have it handed on, and another magpie brings the answer home.
 - **CPU-frugal rendering** — the base layer (background, cards, text) is redrawn at most
   once a second and each frame only paints what moves; rotation and brightness use vImage
   (SIMD), and each frame goes out as a single USB transfer.
-- **Night blanking** — 18:30–09:00 the LCD goes dark and the dashboard shows in a Mac
-  window instead; can be turned off from the menu bar.
+- **Fits the screen** — the frame size and whether it is turned 180° come from the
+  device's handshake (1920×480, 1920×440, 1280×480, 1600×720…); nothing to set.
 - **USB hotplug** — auto-reconnect on plug/unplug and sleep/wake.
 - **On-Mac preview** — when no LCD is connected it renders to a window instead, so you can
   develop and see changes without the hardware.
@@ -178,7 +196,8 @@ Pick one or the other — enabling both starts two instances that fight over the
 .build/release/MacTR                 # menu-bar app (LCD, or preview window if no LCD)
 .build/release/MacTR --preview       # force the on-Mac preview window
 .build/release/MacTR --snapshot x.png              # render one frame to a PNG
-.build/release/MacTR --snapshot x.jpg --rotate     # the exact JPEG the LCD receives
+.build/release/MacTR --snapshot x.jpg              # the JPEG the LCD receives (turned 180°); --no-rotate for upright
+.build/release/MacTR --snapshot x.png --size 1280x480   # draw for another screen size
 .build/release/MacTR --gif x.gif --frames 40 --fps 10 --scale 2   # animated demo GIF
 .build/release/MacTR --benchmark 120 [--static]    # LCD frame rate (--static: device + USB only)
 .build/release/MacTR --pipeline-bench              # CPU cost of render + encode per frame
