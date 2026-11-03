@@ -1,6 +1,6 @@
 // SettingsView.swift — Settings window (SwiftUI)
 //
-// Tabs: General | Display | Device | About
+// Tabs: General | Display | magpie | Device | About
 
 import ServiceManagement
 import SwiftUI
@@ -8,6 +8,17 @@ import SwiftUI
 struct SettingsView: View {
     @Bindable var state: AppState
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var hardwareJPEG = JPEGEncoder.useHardware
+
+    // magpie gateway — edited as drafts, applied on 保存. The key is read off
+    // the main thread (loadAPIKey): the first read may wait on a Keychain prompt
+    @State private var gatewayURL = MagpieConfig.savedURL
+    @State private var apiKey = ""
+    @State private var savedGatewayURL = MagpieConfig.savedURL
+    @State private var savedAPIKey = ""
+    @State private var keyLoaded = false
+    @State private var probing = false
+    @State private var gatewayStatus: String?
 
     var body: some View {
         TabView {
@@ -19,8 +30,8 @@ struct SettingsView: View {
                 displaySettings
             }
 
-            Tab("Agents", systemImage: "cpu") {
-                agentSettings
+            Tab("magpie", systemImage: "point.3.connected.trianglepath.dotted") {
+                magpieSettings
             }
 
             Tab("Device", systemImage: "cable.connector") {
@@ -67,17 +78,6 @@ struct SettingsView: View {
 
     private var displaySettings: some View {
         Form {
-            Section("Display Set") {
-                Picker("Active Set", selection: $state.currentSet) {
-                    ForEach(DisplaySet.allCases) { set in
-                        Text(set.rawValue).tag(set)
-                    }
-                }
-                .onChange(of: state.currentSet) {
-                    state.applySettings()
-                }
-            }
-
             Section("Brightness") {
                 HStack {
                     Slider(value: brightnessBinding, in: 1...10, step: 1) {
@@ -104,43 +104,66 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        }
-        .formStyle(.grouped)
-        .padding()
-    }
 
-    // MARK: - Agents Tab
-
-    private var agentSettings: some View {
-        Form {
-            Section("AI Agents 面板") {
-                Picker("左侧", selection: $state.leftAgent) {
-                    ForEach(AgentKind.allCases) { kind in
-                        Text(kind.displayName).tag(kind)
+            Section("Encoding") {
+                Toggle("Hardware JPEG encoding", isOn: $hardwareJPEG)
+                    .onChange(of: hardwareJPEG) { _, on in
+                        JPEGEncoder.useHardware = on
+                        UserDefaults.standard.set(on, forKey: "hardwareJPEG")
                     }
-                }
-                .onChange(of: state.leftAgent) {
-                    state.applyAgentSelection()
-                }
-
-                Picker("右侧", selection: $state.rightAgent) {
-                    ForEach(AgentKind.allCases) { kind in
-                        Text(kind.displayName).tag(kind)
-                    }
-                }
-                .onChange(of: state.rightAgent) {
-                    state.applyAgentSelection()
-                }
-            }
-
-            Section {
-                Text("中间栏左右两列可分别指定 Claude、Codex 或 Cursor。Cursor 的本地日志不含 token 用量，该列会显示「—」。")
+                Text("Encode frames on Apple silicon's media engine: about half the CPU. Turn off if the display shows glitches")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    // MARK: - magpie Tab
+
+    private var magpieSettings: some View {
+        Form {
+            Section("magpie 网关") {
+                TextField("网关地址", text: $gatewayURL, prompt: Text(MagpieConfig.defaultURL))
+                    .textContentType(.URL)
+                SecureField("API Key", text: $apiKey, prompt: Text(keyLoaded ? "本机网关可留空" : "读取钥匙串…"))
+                    .disabled(!keyLoaded)
+                HStack {
+                    Button("测试连接", action: probeGateway)
+                        .disabled(probing || !keyLoaded)
+                    Button("保存", action: saveGateway)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!keyLoaded || (gatewayURL == savedGatewayURL && apiKey == savedAPIKey))
+                    Spacer()
+                    if probing {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                if let gatewayStatus {
+                    Text(gatewayStatus)
+                        .font(.caption)
+                        .foregroundStyle(gatewayStatus.hasPrefix("✗") ? .red : .green)
+                }
+            }
+
+            Section {
+                Text("地址留空即本机网关 \(MagpieConfig.defaultURL)。远程网关填网页 Key（magpie web 登录链接里 k= 的值）才有路由和用量；只填网关 Key 时只有订阅用量。Key 类型自动识别，保存在系统钥匙串中。保存后副屏约 1 秒内切换。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+        .task { await loadAPIKey() }
+    }
+
+    private func loadAPIKey() async {
+        guard !keyLoaded else { return }
+        let key = await Task.detached { MagpieConfig.apiKey }.value
+        apiKey = key
+        savedAPIKey = key
+        keyLoaded = true
     }
 
     // MARK: - Device Tab
@@ -211,6 +234,26 @@ struct SettingsView: View {
     }
 
     // MARK: - Helpers
+
+    private func probeGateway() {
+        probing = true
+        gatewayStatus = nil
+        let url = gatewayURL, key = apiKey
+        Task {
+            let result = await Task.detached { MagpieCollector.probe(url: url, apiKey: key) }.value
+            gatewayStatus = result
+            probing = false
+        }
+    }
+
+    private func saveGateway() {
+        MagpieConfig.save(url: gatewayURL, apiKey: apiKey)
+        gatewayURL = MagpieConfig.savedURL
+        apiKey = MagpieConfig.apiKey
+        savedGatewayURL = gatewayURL
+        savedAPIKey = apiKey
+        gatewayStatus = "已保存 · 正在切换到 \(MagpieConfig.baseURL)"
+    }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
         do {

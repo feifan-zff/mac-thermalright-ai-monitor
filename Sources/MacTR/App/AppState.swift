@@ -8,16 +8,8 @@ import AppKit
 import Foundation
 import Observation
 
-// MARK: - Display Set
-
 extension Notification.Name {
     static let deviceStateChanged = Notification.Name("deviceStateChanged")
-}
-
-enum DisplaySet: String, CaseIterable, Identifiable, Sendable {
-    case systemMonitor = "System Monitor"
-
-    var id: String { rawValue }
 }
 
 // MARK: - Night schedule
@@ -27,8 +19,16 @@ enum DisplaySet: String, CaseIterable, Identifiable, Sendable {
 enum NightSchedule {
     static let startMinute = 18 * 60 + 30   // 18:30
     static let endMinute = 9 * 60           // 09:00
+    private static let enabledKey = "nightBlankEnabled"
+
+    /// User toggle (menu bar). When off, the LCD stays live around the clock.
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
 
     static var isNight: Bool {
+        guard isEnabled else { return false }
         let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
         let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
         return startMinute < endMinute
@@ -49,14 +49,10 @@ final class AppState {
     var statusMessage = "Disconnected"
 
     // Display
-    var currentSet: DisplaySet = .systemMonitor
-    var brightness: Int = 5
+    // Brightness / rotation persist across launches (the cooler doesn't move)
+    var brightness: Int = UserDefaults.standard.object(forKey: "brightness") as? Int ?? 5
     var refreshInterval: Double = 0.5
-    var rotateDisplay: Bool = false
-
-    // AI Agents panel — which source fills each column
-    var leftAgent: AgentKind = AgentKind.left
-    var rightAgent: AgentKind = AgentKind.right
+    var rotateDisplay: Bool = UserDefaults.standard.bool(forKey: "rotateDisplay")
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -87,11 +83,13 @@ final class AppState {
             }
         }
         engine = eng
-        eng.start(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        eng.start(brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
     }
 
+    /// Stop for good (quit): waits out the frame being sent, so the LCD is never
+    /// left mid-frame.
     func stop() {
-        engine?.stop()
+        engine?.stopAndWait()
         engine = nil
         isConnected = false
         statusMessage = "Stopped"
@@ -108,16 +106,11 @@ final class AppState {
         frameCount = 0
     }
 
-    /// Called when user changes display set, brightness, or interval
+    /// Called when user changes brightness, rotation, or interval
     func applySettings() {
-        engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
-    }
-
-    /// Persist the AI Agents column mapping. The renderer reads AgentKind.left /
-    /// AgentKind.right on the next frame, so no engine restart is needed.
-    func applyAgentSelection() {
-        AgentKind.left = leftAgent
-        AgentKind.right = rightAgent
+        UserDefaults.standard.set(brightness, forKey: "brightness")
+        UserDefaults.standard.set(rotateDisplay, forKey: "rotateDisplay")
+        engine?.updateSettings(brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
     }
 
     /// Latest rendered frame for the on-Mac preview window
@@ -163,30 +156,32 @@ final class DisplayEngine: @unchecked Sendable {
     private var running = false
     private var frameCount = 0
     private var lastFrameSize = 0
+    private var fpsFrames = 0
+    private var fpsSince = Date()
+    private let frameWake = DispatchSemaphore(value: 0)   // the frame loop's sleep, cut short by stop()
+    private var quitting = false
+    // The last frame encoded, and what it was encoded with (usbQueue only)
+    private var lastEncoded: (image: CGImage, brightness: Int, rotate: Bool, jpeg: Data)?
 
     // Settings (atomically accessed)
-    private var currentSet: DisplaySet = .systemMonitor
     private var brightness: Int = 5
     private var interval: Double = 0.5
     private var rotateDisplay: Bool = false
 
-    // Renderers
-    private let monitorRenderer = MonitorRenderer()
+    private let renderer = MagpieRenderer()
 
     init(statusCallback: @escaping @Sendable (EngineStatus) -> Void) {
         self.statusCallback = statusCallback
     }
 
-    func start(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
-        self.currentSet = set
+    func start(brightness: Int, interval: Double, rotate: Bool) {
         self.brightness = brightness
         self.interval = interval
         self.rotateDisplay = rotate
 
         usbQueue.async { [weak self] in
             guard let self else { return }
-            // Start background metrics collection (primes before returning)
-            self.monitorRenderer.startMetrics()
+            self.renderer.startMetrics()
             self.setupHotplug()
             self.connectAndRun()
         }
@@ -194,13 +189,24 @@ final class DisplayEngine: @unchecked Sendable {
 
     func stop() {
         running = false
-        monitorRenderer.stopMetrics()
+        frameWake.signal()   // cut the frame loop's sleep short
+        renderer.stopMetrics()
         usbQueue.async { [weak self] in
             self?.hotplug?.stop()
             self?.hotplug = nil
             self?.device?.close()
             self?.device = nil
         }
+    }
+
+    /// Stop, and return only once the frame loop has let go of the device. A
+    /// process killed mid-transfer leaves the LCD waiting for the rest of that
+    /// frame: it ignores everything after (even a handshake) until it is
+    /// unplugged, so quitting must never cut a frame short.
+    func stopAndWait() {
+        quitting = true   // no reconnect (a send error's retry) once we're on the way out
+        stop()
+        usbQueue.sync {}
     }
 
     func reconnect() {
@@ -212,12 +218,11 @@ final class DisplayEngine: @unchecked Sendable {
     /// Latest rendered frame for the on-Mac preview window (used while the LCD
     /// is disconnected). Thread-safe: render() serializes internally.
     func currentFrame() -> CGImage? {
-        monitorRenderer.render()
+        renderer.render()
     }
 
-    func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
-        log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
-        self.currentSet = set
+    func updateSettings(brightness: Int, interval: Double, rotate: Bool) {
+        log("[Engine] Settings updated: brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
         self.brightness = brightness
         self.interval = interval
         self.rotateDisplay = rotate
@@ -226,10 +231,10 @@ final class DisplayEngine: @unchecked Sendable {
     // MARK: - Private (all on usbQueue)
 
     private func connectAndRun() {
-        guard !running else { return }
+        guard !running, !quitting else { return }
 
-        // Ensure metrics collection is running (may have been stopped on disconnect/sleep)
-        monitorRenderer.startMetrics()
+        // Ensure gateway polling is running (may have been stopped on disconnect/sleep)
+        renderer.startMetrics()
 
         // Close existing connection
         device?.close()
@@ -254,6 +259,8 @@ final class DisplayEngine: @unchecked Sendable {
 
         do {
             let info = try LYProtocol.handshake(device: dev)
+            DisplayShape.update(pm: info.pm)
+            log("[*] Device PM=\(info.pm) SUB=\(info.sub) FBL=\(info.fbl) → corner radius \(Int(DisplayShape.cornerRadius))px")
             device = dev
             postStatus(connected: true, deviceInfo: info,
                        message: "Connected (\(info.width)x\(info.height))")
@@ -275,18 +282,19 @@ final class DisplayEngine: @unchecked Sendable {
             // Mac preview instead. Refresh the black frame slowly to save power.
             let night = NightSchedule.isNight
 
-            // Adaptive frame rate: the device sustains ~19fps, but the dashboard's
-            // data only changes every ~2s. Run fast (15fps) ONLY while a column is
-            // animating (agent working → breathing, or done → blinking); otherwise
-            // idle at the configured interval to save CPU/power on this always-on app.
-            let animating = !night && (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
-            let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : interval)
+            // Adaptive frame rate: the device sustains ~26fps (~19 on the original
+            // revision), but the routing panel only moves while a request is
+            // played. 20fps while a magpie flies (a wing beat is .42s), 10fps
+            // while a request only waits — every frame is a full JPEG encode +
+            // USB transfer — otherwise idle at the configured interval to save
+            // CPU/power on this always-on app.
+            let fps = night ? nil : renderer.preferredFrameRate()
+            let frameInterval = night ? 3.0 : (fps.map { 1.0 / $0 } ?? interval)
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
             autoreleasepool {
-                let set = currentSet
                 let bright = brightness
                 let rotate = rotateDisplay
 
@@ -294,15 +302,18 @@ final class DisplayEngine: @unchecked Sendable {
 
                 if night {
                     jpeg = DisplayEngine.blackFrame(rotate: rotate)
-                } else {
-                    switch set {
-                    case .systemMonitor:
-                        if let image = monitorRenderer.render() {
-                            jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
-                        } else {
-                            jpeg = nil
-                        }
+                } else if let image = renderer.render() {
+                    // Idle, the renderer hands back the same image until something
+                    // changes: send the JPEG already made of it (an encode is most
+                    // of a frame's cost)
+                    if let last = lastEncoded, last.image === image, last.brightness == bright, last.rotate == rotate {
+                        jpeg = last.jpeg
+                    } else {
+                        jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
+                        lastEncoded = jpeg.map { (image, bright, rotate, $0) }
                     }
+                } else {
+                    jpeg = nil
                 }
 
                 if let jpeg {
@@ -310,6 +321,14 @@ final class DisplayEngine: @unchecked Sendable {
                         try LYProtocol.sendFrame(device: device, jpegData: jpeg)
                         frameCount += 1
                         lastFrameSize = jpeg.count
+                        fpsFrames += 1
+                        let elapsed = Date().timeIntervalSince(fpsSince)
+                        if elapsed >= 30 {
+                            log(String(format: "[Engine] %.1f fps over %.0fs, ~%dKB/frame",
+                                       Double(fpsFrames) / elapsed, elapsed, jpeg.count / 1024))
+                            fpsFrames = 0
+                            fpsSince = Date()
+                        }
                         if frameCount == 1 {
                             log("[OK] Active! ~\(jpeg.count / 1024)KB/frame")
                         }
@@ -334,7 +353,7 @@ final class DisplayEngine: @unchecked Sendable {
             // If work took longer than interval, send next frame immediately
             let now = DispatchTime.now()
             if nextDeadline > now {
-                Thread.sleep(forTimeInterval: Double(nextDeadline.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000_000)
+                _ = frameWake.wait(timeout: nextDeadline)
             } else {
                 // Work exceeded interval — reset deadline to avoid cascading catch-up
                 nextDeadline = now
@@ -350,7 +369,7 @@ final class DisplayEngine: @unchecked Sendable {
             self.usbQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self, !self.running else { return }
                 log("[Hotplug] Attempting reconnect...")
-                self.monitorRenderer.startMetrics()
+                self.renderer.startMetrics()
                 self.connectAndRun()
             }
         }
