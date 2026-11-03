@@ -18,6 +18,7 @@ struct SettingsView: View {
     @State private var savedAPIKey = ""
     @State private var keyLoaded = false
     @State private var probing = false
+    @State private var saving = false
     @State private var gatewayStatus: String?
 
     var body: some View {
@@ -95,16 +96,6 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Rotation") {
-                Toggle("Rotate 180°", isOn: $state.rotateDisplay)
-                    .onChange(of: state.rotateDisplay) {
-                        state.applySettings()
-                    }
-                Text("Enable if display appears upside down")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             Section("Encoding") {
                 Toggle("Hardware JPEG encoding", isOn: $hardwareJPEG)
                     .onChange(of: hardwareJPEG) { _, on in
@@ -134,7 +125,7 @@ struct SettingsView: View {
                         .disabled(probing || !keyLoaded)
                     Button("保存", action: saveGateway)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!keyLoaded || (gatewayURL == savedGatewayURL && apiKey == savedAPIKey))
+                        .disabled(saving || !keyLoaded || (gatewayURL == savedGatewayURL && apiKey == savedAPIKey))
                     Spacer()
                     if probing {
                         ProgressView().controlSize(.small)
@@ -247,12 +238,22 @@ struct SettingsView: View {
     }
 
     private func saveGateway() {
-        MagpieConfig.save(url: gatewayURL, apiKey: apiKey)
-        gatewayURL = MagpieConfig.savedURL
-        apiKey = MagpieConfig.apiKey
-        savedGatewayURL = gatewayURL
-        savedAPIKey = apiKey
-        gatewayStatus = "已保存 · 正在切换到 \(MagpieConfig.baseURL)"
+        saving = true
+        let url = gatewayURL, key = apiKey
+        Task {
+            defer { saving = false }
+            do {
+                try await Task.detached { try MagpieConfig.save(url: url, apiKey: key) }.value
+                savedGatewayURL = MagpieConfig.savedURL
+                savedAPIKey = MagpieConfig.apiKey
+                // Preserve edits made while the Keychain operation was pending.
+                if gatewayURL == url { gatewayURL = savedGatewayURL }
+                if apiKey == key { apiKey = savedAPIKey }
+                gatewayStatus = "已保存 · 正在切换到 \(MagpieConfig.baseURL)"
+            } catch {
+                gatewayStatus = "✗ " + error.localizedDescription
+            }
+        }
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {

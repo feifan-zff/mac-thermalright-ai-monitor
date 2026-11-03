@@ -37,6 +37,7 @@ struct MagpieTry: Sendable {
     let again: Bool         // retried on the same member
     let credits: Bool       // went on to the member's credits
     let earlier: Bool
+    let served: String?     // the model that answered, as the upstream names it (a remote magpie hides who is behind it)
 
     /// The page's tryOk, inverted: a reply that broke off after its 200 has a fail.
     var failed: Bool { done && !((status ?? 0) > 0 && (status ?? 0) < 400 && fail == nil) }
@@ -99,16 +100,18 @@ struct MagpieRoute: Sendable {
     let folder: String?
 
     var inFlight: Bool { !done }
-    var failed: Bool { done && (status ?? 0) != 200 }
+    var failed: Bool {
+        done && ((status ?? 0) != 200 || error != nil || tries.last?.failed == true)
+    }
 }
 
-struct MagpieQuotaWindow: Sendable {
+struct MagpieQuotaWindow: Sendable, Equatable {
     let name: String
     let usedPercent: Double
     let resetsAt: Date?
 }
 
-struct MagpieQuota: Sendable {
+struct MagpieQuota: Sendable, Equatable {
     let provider: String    // "us/claude", "codex", …
     let name: String        // "Claude Code"
     let plan: String?
@@ -138,6 +141,7 @@ struct MagpieToday: Sendable {
 }
 
 struct MagpieSnapshot: Sendable {
+    let generation: Int             // the configuration that produced this snapshot
     let online: Bool
     let error: String?              // why offline: unreachable / rejected key / HTTP status
     let routingNote: String?        // online, but why there is no routing data
@@ -168,6 +172,10 @@ final class MagpieCollector: @unchecked Sendable {
         cfg.httpCookieAcceptPolicy = .never
         return URLSession(configuration: cfg, delegate: NoRedirects(), delegateQueue: nil)
     }()
+
+    deinit {
+        session.invalidateAndCancel()
+    }
 
     /// How this gateway is read: its API with a gateway key, or its web page.
     private enum Access { case gateway, web }
@@ -207,7 +215,7 @@ final class MagpieCollector: @unchecked Sendable {
 
     // What the last snapshot showed, in short: a change bumps its version
     private var version = 0, quotaVersion = 0, traceTick = 0
-    private var shown = "", quotasShown = ""
+    private var shown = ""
 
     private func stamp(_ s: String) -> Int {
         if s != shown { shown = s; version += 1 }
@@ -215,25 +223,27 @@ final class MagpieCollector: @unchecked Sendable {
     }
 
     private func offline(_ message: String) -> MagpieSnapshot {
-        MagpieSnapshot(online: false, error: message, routingNote: nil, routes: [], quotas: [], today: nil,
+        MagpieSnapshot(generation: generation, online: false, error: message, routingNote: nil, routes: [], quotas: [], today: nil,
                        version: stamp("offline|" + message), quotaVersion: quotaVersion)
     }
 
     /// One poll. `quotas` also refreshes the subscription quotas, `usage` today's usage.
     func collect(quotas: Bool, usage: Bool) -> MagpieSnapshot {
-        let gen = MagpieConfig.generation
+        let config = MagpieConfig.configuration()
+        let gen = config.generation
         var refreshQuotas = quotas, refreshUsage = usage
         if gen != generation {
             // New gateway / key: nothing from the old one may leak into the display
             generation = gen
             routesByID = [:]; lastSeq = nil; cachedQuotas = []; quotasRead = false; usageSeen = [:]; cachedToday = nil
             traceTick += 1
+            quotaVersion += 1
             traceForbidden = false
             access = .gateway; webCookie = nil
             refreshQuotas = true
             refreshUsage = true
         }
-        let base = baseURL, key = MagpieConfig.apiKey
+        let base = config.baseURL, key = config.apiKey
 
         var trace: [String: Any]?
         if !traceForbidden || refreshQuotas {
@@ -257,13 +267,9 @@ final class MagpieCollector: @unchecked Sendable {
             quotasRead = true   // none, or none readable, waits for its cadence: not a fetch a second
             switch request(base: base, .quotas, key: key) {
             case .success(let q):
-                cachedQuotas = parseQuotas(q)
-                let s = cachedQuotas.map { q in
-                    ([q.provider, q.user ?? "", q.error ?? "", q.balance ?? "", "\(q.activeAt?.timeIntervalSince1970 ?? 0)"]
-                     + q.windows.map { "\($0.name)=\($0.usedPercent)@\($0.resetsAt?.timeIntervalSince1970 ?? 0)" })
-                        .joined(separator: "|")
-                }.joined(separator: "\n")
-                if s != quotasShown { quotasShown = s; quotaVersion += 1 }
+                let updated = parseQuotas(q)
+                if updated != cachedQuotas { quotaVersion += 1 }
+                cachedQuotas = updated
             case .failure(let err):
                 // Neither endpoint answers: this key really can't read the gateway
                 if traceForbidden { return offline(err.message) }
@@ -283,7 +289,7 @@ final class MagpieCollector: @unchecked Sendable {
         }
         let today = cachedToday.map { "\($0.calls)|\($0.tokens)|\($0.cost ?? -1)|\($0.unpriced)" } ?? ""
         return MagpieSnapshot(
-            online: true, error: nil,
+            generation: generation, online: true, error: nil,
             routingNote: traceForbidden ? Self.routingLocalOnly : nil,
             routes: routesByID.values.sorted { $0.seq < $1.seq },
             quotas: cachedQuotas,
@@ -446,7 +452,8 @@ final class MagpieCollector: @unchecked Sendable {
                 rest: Self.rest(t["rest"]),
                 again: t["again"] as? Bool ?? false,
                 credits: t["credits"] as? Bool ?? false,
-                earlier: t["earlier"] as? Bool ?? false)
+                earlier: t["earlier"] as? Bool ?? false,
+                served: (t["served"] as? String).flatMap { $0.isEmpty ? nil : $0 })
         }
         return MagpieRoute(
             id: id, seq: seq, time: time,

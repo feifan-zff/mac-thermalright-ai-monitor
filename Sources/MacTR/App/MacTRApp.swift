@@ -20,6 +20,12 @@ func log(_ message: String) {
 @main
 struct MacTREntry {
     static func main() {
+        // --size WxH draws for another screen than the last one seen (the modes
+        // below that need no LCD); the device modes take theirs from the handshake
+        if let size = parseSize(CommandLine.arguments) {
+            Layout.update(width: size.w, height: size.h)
+        }
+
         // CLI mode
         if CommandLine.arguments.contains("--cli") {
             runCLI()
@@ -46,16 +52,16 @@ struct MacTREntry {
         }
 
         // Snapshot mode: render one frame and save as PNG (or the device JPEG)
-        // Usage: --snapshot path.png|path.jpg [--brightness N] [--rotate]
+        // Usage: --snapshot path.png|path.jpg [--brightness N] [--no-rotate] [--size WxH]
         if CommandLine.arguments.contains("--snapshot") {
             if let image = primedRenderer().render() {
                 let url = URL(fileURLWithPath: CommandLine.arguments.last == "--snapshot"
                     ? "snapshot.png" : CommandLine.arguments[CommandLine.arguments.firstIndex(of: "--snapshot")! + 1])
                 if url.pathExtension == "jpg" {
-                    // The exact bytes the LCD receives (device orientation, brightness applied)
+                    // The bytes the LCD receives (turned 180° as a known screen is, brightness applied)
                     let level = parseFlag(CommandLine.arguments, flag: "--brightness") ?? 1
-                    let rotate = CommandLine.arguments.contains("--rotate")
-                    try? JPEGEncoder.encode(image, brightness: level, rotate: rotate)?.write(to: url)
+                    let rotate180 = !CommandLine.arguments.contains("--no-rotate")
+                    try? JPEGEncoder.encode(image, brightness: level, rotate180: rotate180)?.write(to: url)
                     log("[Snapshot] Saved device JPEG to \(url.path)")
                 } else if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
                     CGImageDestinationAddImage(dest, image, nil)
@@ -98,7 +104,7 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[Preview] Starting preview window (no LCD)")
 
-        // Half-scale window keeps the 1920x480 frame readable on a laptop screen
+        // Half-scale window keeps the frame readable on a laptop screen
         let contentSize = NSSize(width: Layout.width / 2, height: Layout.height / 2)
         window = NSWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
@@ -127,8 +133,7 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     private func refresh() {
         guard let image = renderer.render() else { return }
-        imageView.image = NSImage(cgImage: image,
-                                  size: NSSize(width: Layout.width, height: Layout.height))
+        imageView.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -147,13 +152,14 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let appState = AppState()
     private var menu: NSMenu!
 
-    // On-Mac preview — shown automatically while the LCD is disconnected OR during
-    // the nightly window (18:30–09:00, when the LCD is blanked). `previewShown`
-    // tracks our intent so the timer doesn't re-open / re-focus it every tick.
+    // On-Mac preview — shown automatically while the LCD is disconnected.
+    // `previewShown` tracks our intent so the timer doesn't re-open / re-focus it
+    // every tick.
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
     private var previewShown = false
+    private var previewCanvas = (w: 0, h: 0)   // the screen size the window is shaped for
 
     // Menu items that need updating
     private var statusMenuItem: NSMenuItem!
@@ -216,7 +222,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             self?.updateDisplayTarget()
         }
 
-        // Timer to refresh menu + icon, and to react to the night-window schedule
+        // Timer to refresh menu + icon
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updateIcon()
@@ -361,12 +367,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewItem.target = self
         menu.addItem(previewItem)
 
-        // Night blanking (18:30–09:00) on/off
-        let nightItem = NSMenuItem(title: "Blank LCD at Night", action: #selector(toggleNightBlank(_:)), keyEquivalent: "")
-        nightItem.target = self
-        nightItem.state = NightSchedule.isEnabled ? .on : .off
-        menu.addItem(nightItem)
-
         menu.addItem(.separator())
 
         // About
@@ -395,11 +395,10 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     // MARK: - Preview Window (auto-fallback when LCD is disconnected)
 
-    /// Show the dashboard on the Mac when the LCD isn't the right target:
-    /// either it's disconnected, or we're inside the night window (LCD blanked).
+    /// Show the dashboard on the Mac while the LCD is disconnected.
     /// Transition-based so we don't grab focus every second.
     private func updateDisplayTarget() {
-        let wantPreview = !appState.isConnected || NightSchedule.isNight
+        let wantPreview = !appState.isConnected
         if wantPreview && !previewShown {
             showPreview(); previewShown = true
         } else if !wantPreview && previewShown {
@@ -409,13 +408,14 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func showPreview() {
         if previewWindow == nil {
-            let contentSize = NSSize(width: Layout.width / 2, height: Layout.height / 2)
+            previewCanvas = (Layout.width, Layout.height)
+            let contentSize = NSSize(width: previewCanvas.w / 2, height: previewCanvas.h / 2)
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: contentSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered, defer: false)
             window.title = "MacTR — 本机预览"
-            window.contentAspectRatio = NSSize(width: Layout.width, height: Layout.height)
+            window.contentAspectRatio = NSSize(width: previewCanvas.w, height: previewCanvas.h)
             window.isReleasedWhenClosed = false
             window.delegate = self
 
@@ -448,23 +448,26 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func refreshPreview() {
         guard let image = appState.currentFrame() else { return }
-        previewImageView?.image = NSImage(
-            cgImage: image, size: NSSize(width: Layout.width, height: Layout.height))
+        fitPreviewWindow(width: image.width, height: image.height)
+        previewImageView?.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
+    /// The LCD found on connect may be another size than the last one seen: the
+    /// window takes its shape.
+    private func fitPreviewWindow(width: Int, height: Int) {
+        guard let window = previewWindow, previewCanvas != (width, height) else { return }
+        previewCanvas = (width, height)
+        window.contentAspectRatio = NSSize(width: width, height: height)
+        window.setContentSize(NSSize(width: width / 2, height: height / 2))
     }
 
     @objc private func showPreviewManually() {
         showPreview(); previewShown = true
     }
 
-    @objc private func toggleNightBlank(_ sender: NSMenuItem) {
-        NightSchedule.isEnabled.toggle()
-        sender.state = NightSchedule.isEnabled ? .on : .off
-        updateDisplayTarget()
-    }
-
     // User closed the preview window — stop rendering to it. previewShown stays true
     // so we don't immediately reopen it; it comes back on the next display-target
-    // transition (LCD unplug, or entering/leaving the night window).
+    // transition (LCD unplug).
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
         previewTimer?.invalidate()
@@ -494,13 +497,25 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
 
+        // What the handshake found: the frame is drawn at this size, and turned
+        // 180° if the screen is mounted that way
+        let screen: String
+        if appState.isConnected, let info = appState.deviceInfo {
+            screen = "\(info.width)×\(info.height)" + (info.needsRotation ? ", rotated 180°" : "")
+        } else {
+            screen = "not connected (last seen \(Layout.width)×\(Layout.height))"
+        }
+
         let alert = NSAlert()
         alert.messageText = "MacTR AI"
         alert.informativeText = """
             Version \(version) (Build \(build))
 
-            magpie routing + subscription usage on the
-            Thermalright Trofeo Vision 9.16 LCD.
+            magpie routing + subscription usage on a
+            Thermalright LCD cooler screen. The picture
+            follows the screen's size and orientation.
+
+            Screen: \(screen)
 
             Built with Swift + libusb
             github.com/m1ng-li/mac-thermalright-ai-monitor
@@ -534,7 +549,6 @@ private func runBenchmark() {
     let args = CommandLine.arguments
     let frames = parseFlag(args, flag: "--benchmark") ?? 120
     let brightness = parseFlag(args, flag: "-b") ?? 5
-    let rotate = args.contains("--rotate")
 
     print("[Bench] Frame-rate benchmark — \(frames) frames")
     let device = USBDevice()
@@ -544,14 +558,17 @@ private func runBenchmark() {
     }
     defer { device.close() }
 
-    do { _ = try LYProtocol.handshake(device: device) }
+    let info: DeviceInfo
+    do { info = try LYProtocol.handshake(device: device) }
     catch { print("[Bench][ERROR] handshake failed: \(error)"); return }
+    let rotate = info.needsRotation
+    Layout.update(width: info.width, height: info.height)
 
     // --static: re-send one pre-encoded frame — isolates device + USB throughput
     let renderer = primedRenderer()
     var staticJPEG: Data?
     if args.contains("--static"), let img = renderer.render() {
-        staticJPEG = JPEGEncoder.encode(img, brightness: brightness, rotate: rotate)
+        staticJPEG = JPEGEncoder.encode(img, brightness: brightness, rotate180: rotate)
     }
 
     func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000 }  // ms
@@ -559,7 +576,7 @@ private func runBenchmark() {
     // Warm up: first render + JPEG/rotation contexts allocate; discard 5 frames
     for _ in 0..<5 {
         if let img = renderer.render(),
-           let j = JPEGEncoder.encode(img, brightness: brightness, rotate: rotate) {
+           let j = JPEGEncoder.encode(img, brightness: brightness, rotate180: rotate) {
             try? LYProtocol.sendFrame(device: device, jpegData: j)
         }
     }
@@ -574,7 +591,7 @@ private func runBenchmark() {
         let image = staticJPEG == nil ? renderer.render() : nil
         guard staticJPEG != nil || image != nil else { continue }
         let r1 = now()
-        guard let jpeg = staticJPEG ?? image.flatMap({ JPEGEncoder.encode($0, brightness: brightness, rotate: rotate) })
+        guard let jpeg = staticJPEG ?? image.flatMap({ JPEGEncoder.encode($0, brightness: brightness, rotate180: rotate) })
         else { continue }
         let r2 = now()
         do { try LYProtocol.sendFrame(device: device, jpegData: jpeg) }
@@ -670,10 +687,9 @@ private func runCLI() {
     let args = CommandLine.arguments
     let isTest = args.contains("--test")
     let brightness = parseFlag(args, flag: "-b") ?? 5
-    let rotate = args.contains("--rotate")
 
     log("[*] MacTR CLI — \(isTest ? "USB Test" : "magpie dashboard")")
-    log("[*] Brightness: level \(brightness) (\(Brightness.factor(for: brightness))x), Rotate: \(rotate)")
+    log("[*] Brightness: level \(brightness) (\(Brightness.factor(for: brightness))x)")
     log("[*] Searching for Thermalright LCD...")
 
     let device = USBDevice()
@@ -694,9 +710,12 @@ private func runCLI() {
         log("[ERROR] Handshake failed: \(error)")
         return
     }
+    let rotate = info.needsRotation
+    Layout.update(width: info.width, height: info.height)
+    log("[*] Screen \(info.width)x\(info.height), rotate 180°: \(rotate)")
 
     if isTest {
-        guard let jpeg = makeTestJPEG(width: info.width, height: info.height) else {
+        guard let jpeg = makeTestJPEG(width: info.width, height: info.height, rotate180: rotate) else {
             log("[ERROR] Failed to create test image")
             return
         }
@@ -711,7 +730,7 @@ private func runCLI() {
         var count = 0
         while true {
             guard let image = renderer.render(),
-                  let jpeg = JPEGEncoder.encode(image, brightness: brightness, rotate: rotate)
+                  let jpeg = JPEGEncoder.encode(image, brightness: brightness, rotate180: rotate)
             else {
                 Thread.sleep(forTimeInterval: 1)
                 continue
@@ -762,9 +781,16 @@ private func parseFlag(_ args: [String], flag: String) -> Int? {
     return Int(args[idx + 1])
 }
 
+/// `--size 1280x480`
+private func parseSize(_ args: [String]) -> (w: Int, h: Int)? {
+    guard let idx = args.firstIndex(of: "--size"), idx + 1 < args.count else { return nil }
+    let parts = args[idx + 1].lowercased().split(separator: "x").compactMap { Int($0) }
+    return parts.count == 2 && parts[0] > 0 && parts[1] > 0 ? (parts[0], parts[1]) : nil
+}
+
 // MARK: - Test Image
 
-func makeTestJPEG(width: Int, height: Int) -> Data? {
+func makeTestJPEG(width: Int, height: Int, rotate180: Bool = false) -> Data? {
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(
         data: nil, width: width, height: height,
@@ -811,7 +837,7 @@ func makeTestJPEG(width: Int, height: Int) -> Data? {
     ctx.restoreGState()
 
     guard let image = ctx.makeImage() else { return nil }
-    return JPEGEncoder.encode(image)
+    return JPEGEncoder.encode(image, rotate180: rotate180)
 }
 
 // MARK: - Pipeline benchmark
@@ -834,7 +860,7 @@ private func runPipelineBench() {
             let t0 = DispatchTime.now().uptimeNanoseconds
             guard let img = renderer.render() else { return }
             let t1 = DispatchTime.now().uptimeNanoseconds
-            _ = JPEGEncoder.encode(img, brightness: level, rotate: false)
+            _ = JPEGEncoder.encode(img, brightness: level, rotate180: true)
             let t2 = DispatchTime.now().uptimeNanoseconds
             renderT += Double(t1 - t0) / 1e6
             encodeT += Double(t2 - t1) / 1e6

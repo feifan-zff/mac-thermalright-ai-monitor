@@ -12,7 +12,8 @@ import VideoToolbox
 // MARK: - Protocol
 
 protocol FrameRenderer {
-    /// Render a full 1920x480 frame. Returns CGImage in device orientation.
+    /// Render a full frame at `Layout.width` × `Layout.height`, upright (the
+    /// encoder turns it for a screen mounted upside down).
     func render() -> CGImage?
 }
 
@@ -20,26 +21,27 @@ protocol FrameRenderer {
 
 enum JPEGEncoder {
 
-    /// Encode CGImage to JPEG Data with 180° rotation and brightness adjustment.
+    /// Encode CGImage to JPEG Data, turned 180° if the screen is mounted that way
+    /// (`DeviceInfo.needsRotation`), with brightness adjustment.
     /// Reduces quality if over 650KB (matches Python behavior).
     ///
     /// Pixel work (rotation, brightness) runs on the CPU with Accelerate/vImage:
     /// ~0.3ms per 1920×480 frame, versus ~7ms for a CG rotate plus a Core Image
     /// GPU round trip (upload, render, blocking readback) it replaced.
     static func encode(
-        _ image: CGImage, brightness: Int = 1, rotate: Bool = true, maxBytes: Int = 650_000
+        _ image: CGImage, brightness: Int = 1, rotate180: Bool = false, maxBytes: Int = 650_000
     ) -> Data? {
         // process() writes into a shared buffer that lives until the JPEG is out
         encodeLock.lock()
         defer { encodeLock.unlock() }
         let factor = Brightness.factor(for: brightness)
-        if hardwareOn, let data = hardwareJPEG.encode(image, rotate180: !rotate, factor: factor),
+        if hardwareOn, let data = hardwareJPEG.encode(image, rotate180: rotate180, factor: factor),
            data.count <= maxBytes {
             return data
         }
         var finalImage = image
-        if !rotate || factor > 1.0,
-           let processed = process(image, rotate180: !rotate, factor: factor) {
+        if rotate180 || factor > 1.0,
+           let processed = process(image, rotate180: rotate180, factor: factor) {
             finalImage = processed
         }
 
@@ -108,6 +110,8 @@ enum JPEGEncoder {
         let w = image.width, h = image.height
         let rowBytes = w * 4
         guard let srcData = rgbaBytes(image) else { return nil }
+        // vImage borrows the raw pointer; keep its CFData owner alive through the copy.
+        defer { withExtendedLifetime(srcData) {} }
         if outBufferSize != rowBytes * h {
             outBuffer?.deallocate()
             outBuffer = UnsafeMutableRawPointer.allocate(byteCount: rowBytes * h, alignment: 64)
@@ -282,6 +286,7 @@ private final class HardwareJPEG {
     /// The frame as BGRA in a pooled IOSurface buffer: turned and brightened as asked.
     private func fill(_ image: CGImage, pool: CVPixelBufferPool, rotate180: Bool, factor: CGFloat) -> CVPixelBuffer? {
         guard let src = JPEGEncoder.rgbaBytes(image) else { return nil }
+        defer { withExtendedLifetime(src) {} }
         var pb: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess, let pb else { return nil }
         CVPixelBufferLockBaseAddress(pb, [])

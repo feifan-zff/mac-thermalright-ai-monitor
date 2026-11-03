@@ -62,19 +62,42 @@ enum Color {
 
 // MARK: - Layout
 
+/// The frame's size follows the screen the handshake found (1920×480, 1920×440,
+/// 1280×480, 1600×720…). The last one seen is remembered, so the on-Mac preview
+/// matches the screen while it's unplugged; 1920×480 until one has been seen.
 enum Layout {
-    static let width = 1920
-    static let height = 480
+    private static let widthKey = "lastDeviceWidth"
+    private static let heightKey = "lastDeviceHeight"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var size: (w: Int, h: Int) = {
+        let w = UserDefaults.standard.integer(forKey: widthKey)
+        let h = UserDefaults.standard.integer(forKey: heightKey)
+        return w > 0 && h > 0 ? (w, h) : (1920, 480)
+    }()
+
+    static var width: Int { lock.withLock { size.w } }
+    static var height: Int { lock.withLock { size.h } }
     static let margin = 14
     static let gap = 10
-    static let panelCount = 5
-    static let panelWidth = (width - 2 * margin - (panelCount - 1) * gap) / panelCount
-    static let panelHeight = height - 2 * margin
+    static var panelHeight: Int { height - 2 * margin }
     static let panelY = margin
 
-    /// X position for panel at index (0-based)
-    static func panelX(_ index: Int) -> Int {
-        margin + index * (panelWidth + gap)
+    /// Switch to a screen's size; true if that changed it. `remember` keeps it for
+    /// the next launch (a real device's, not a `--size` override's).
+    /// Only MagpieRenderer.adaptCanvas calls it with `remember`: it holds the
+    /// renderer's lock, so a frame is never drawn across the change.
+    @discardableResult
+    static func update(width: Int, height: Int, remember: Bool = false) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        if remember {
+            UserDefaults.standard.set(width, forKey: widthKey)
+            UserDefaults.standard.set(height, forKey: heightKey)
+        }
+        return lock.withLock {
+            let changed = size != (width, height)
+            size = (width, height)
+            return changed
+        }
     }
 }
 

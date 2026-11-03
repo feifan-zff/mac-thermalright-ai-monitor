@@ -289,6 +289,16 @@ final class FlightDirector {
 
     // MARK: Time
 
+    /// Request IDs and member IDs are local to one gateway.
+    func reset() {
+        flights.removeAll()
+        seen.removeAll()
+        primed = false
+        hubTicks.removeAll()
+        agentTicks.removeAll()
+        hits.removeAll()
+    }
+
     func update(_ routes: [MagpieRoute], now: Double) {
         var byID: [Int: MagpieRoute] = [:]
         for r in routes { byID[r.id] = r }

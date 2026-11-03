@@ -14,7 +14,7 @@ enum Draw {
     /// Draw vertical gradient background.
     /// In flipped context: Y=0 is top, so bgTop at y=0, bgBot at y=height.
     static func gradientBackground(_ ctx: CGContext) {
-        guard let bg = backgroundImage else { return }
+        guard let bg = backgroundImage() else { return }
         ctx.saveGState()
         // Undo flip: an untransformed, same-size .copy blit takes CG's memcpy fast
         // path (~0.3ms) instead of shading the full gradient every frame (~3.4ms).
@@ -25,26 +25,34 @@ enum Draw {
         ctx.restoreGState()
     }
 
-    /// The vertical background gradient, rendered once.
-    private static let backgroundImage: CGImage? = {
+    private static let backgroundLock = NSLock()
+    nonisolated(unsafe) private static var background: (w: Int, h: Int, image: CGImage)?
+
+    /// The vertical background gradient, rendered once per screen size.
+    private static func backgroundImage() -> CGImage? {
+        backgroundLock.lock(); defer { backgroundLock.unlock() }
+        let w = Layout.width, h = Layout.height
+        if let b = background, b.w == w, b.h == h { return b.image }
         let colors = [Color.bgTop, Color.bgBot] as CFArray
         guard let gradient = CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
             colors: colors, locations: [0, 1]),
             let ctx = CGContext(
-                data: nil, width: Layout.width, height: Layout.height,
-                bitsPerComponent: 8, bytesPerRow: Layout.width * 4,
+                data: nil, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: w * 4,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         // Native CG coords: bgTop at the top edge (y = height)
         ctx.drawLinearGradient(
             gradient,
-            start: CGPoint(x: 0, y: CGFloat(Layout.height)),
+            start: CGPoint(x: 0, y: CGFloat(h)),
             end: CGPoint(x: 0, y: 0),
             options: [])
-        return ctx.makeImage()
-    }()
+        guard let image = ctx.makeImage() else { return nil }
+        background = (w, h, image)
+        return image
+    }
 
     // MARK: - Panel
 

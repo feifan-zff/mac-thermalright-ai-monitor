@@ -53,16 +53,26 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
     private enum Pass { case base, overlay }
 
     // The routing stage's three columns; the gaps between them are the sky a
-    // magpie is seen in (it flies under the cards), so they're wide enough for one
-    private let agentW = 184, hubW = 176, hubH = 160, wireGap = 104
-    private let birdScale: CGFloat = 1.6   // LCD px per page px for the flight
+    // magpie is seen in (it flies under the cards), so they're wide enough for one.
+    // Drawn for a 1920-wide screen; a narrower one shrinks the columns (and the
+    // magpies) in step, the heights stay.
+    private static let designUsageW = 732, designRouteW: CGFloat = 1150
+    private var stageScale: CGFloat { min(1, CGFloat(routeW) / Self.designRouteW) }
+    private var agentW: Int { Int(184 * stageScale) }
+    private var hubW: Int { Int(176 * stageScale) }
+    private var wireGap: Int { Int(104 * stageScale) }
+    private let hubH = 160
+    private var birdScale: CGFloat { 1.6 * stageScale }   // LCD px per page px for the flight
 
     // Layout
     // 订阅用量 on the left, 路由 on the right
     private let usageX = Layout.margin
-    private let usageW = 732
+    private var usageW: Int { Layout.width * Self.designUsageW / 1920 }
     private var routeX: Int { usageX + usageW + Layout.gap }
     private var routeW: Int { Layout.width - Layout.margin - routeX }
+
+    // The screen size the cached layers were drawn for
+    private var canvas = (w: 0, h: 0)
 
     private let gold = Color.orange
 
@@ -109,6 +119,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             autoreleasepool {
                 // Trace every second; today's usage every 15s, quotas every 30s (both on the first tick)
                 let snap = collector.collect(quotas: tick % 30 == 0, usage: tick % 15 == 0)
+                guard isPolling(gen), snap.generation == MagpieConfig.generation else { return }
                 lock.lock(); _snap = snap; lock.unlock()
                 if snap.online != wasOnline {
                     log("[Magpie] Gateway \(snap.online ? "online" : "offline: \(snap.error ?? "")") (\(collector.baseURL))")
@@ -164,6 +175,16 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
 
     // MARK: - Render
 
+    /// Draw for the screen the handshake found. Waits out a frame being drawn, so
+    /// none is ever drawn across the change.
+    func adaptCanvas(width: Int, height: Int) {
+        renderMutex.lock()
+        defer { renderMutex.unlock() }
+        if Layout.update(width: width, height: height, remember: true) {
+            log("[Magpie] Canvas \(width)x\(height)")
+        }
+    }
+
     func render() -> CGImage? {
         renderMutex.lock()
         defer { renderMutex.unlock() }
@@ -171,19 +192,31 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         lock.lock()
         let snap = _snap
         lock.unlock()
-        guard let snap else { return nil }
+        guard let snap, snap.generation == MagpieConfig.generation else { return nil }
 
         let w = Layout.width
         let h = Layout.height
+        if canvas != (w, h) {   // another screen: every layer was drawn for the old size
+            canvas = (w, h)
+            baseCtx = nil; baseImage = nil; baseKey = ""
+            usageCtx = nil; usageImage = nil; usageKey = ""
+            reusableCtx = nil
+            groupRows = nil
+        }
         let full = CGRect(x: 0, y: 0, width: w, height: h)
         let now = Date().timeIntervalSince1970
 
+        if lastRoutedGeneration != snap.generation {
+            lastRoutedGeneration = snap.generation
+            lastRouted = [:]
+            focusID = nil
+            flights.reset()
+            groupRows = nil
+            baseKey = ""
+            usageKey = ""
+        }
         flights.update(snap.routes, now: now)
         let focus = pickFocus(snap)
-        if lastRoutedGeneration != MagpieConfig.generation {   // another gateway: its models are others
-            lastRoutedGeneration = MagpieConfig.generation
-            lastRouted = [:]
-        }
         let fps = flights.frameRate(now: now)
         lock.lock(); _flightFPS = fps; lock.unlock()
         // Every request still played: under way, or its magpies not yet home —
@@ -375,7 +408,8 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         if let g = groupRows, g.key == baseKey {
             all = g.rows
         } else {
-            all = RoutingGroup.stage(staged, headed: headed, now: Date(timeIntervalSince1970: t), mask: maskAccount)
+            all = RoutingGroup.stage(staged, headed: headed, now: Date(timeIntervalSince1970: t), mask: maskAccount,
+                                     cycles: { cycles(of: $0, in: snap.quotas) })
             groupRows = (baseKey, all)
         }
         let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -793,6 +827,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         let x = rect.minX + 14, cy = rect.midY
         var right = rect.maxX - (shuts ? 38 : 16)
         let titleFont = Fonts.system(18, weight: .semibold), subFont = Fonts.system(15), mono = Fonts.mono(14)
+        let statusFont = row.timed ? Fonts.system(15, weight: .bold) : subFont   // a countdown stands out
         var textX: CGFloat, end: CGFloat
         let status = shuts && open ? row.openStatus : row.status
 
@@ -853,6 +888,14 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             end = chip.maxX
         }
 
+        // The allowance used in its current period, as a bar along the card's
+        // foot: an account's own (a heading or a fold tells of no one account)
+        if row.kind == .member, let used = row.used {
+            let pct = min(max(used, 0), 100)
+            Draw.bar(ctx, x: Int(rect.minX) + 14, y: Int(rect.maxY) - 9, w: Int(rect.width) - 28, h: 4,
+                     percent: pct, color: Color.forPercent(pct))
+        }
+
         // What it says, right-aligned in what room is left
         let room = right - end - 14
         if !status.isEmpty && room > 30 {
@@ -864,8 +907,8 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             case .on, .flying: color = Color.textW
             default: color = row.low ? Color.textS : Color.textL
             }
-            rightText(ctx, truncate(status, font: subFont, maxW: room), right: Int(right), y: Int(cy) - 10,
-                      font: subFont, color: color)
+            rightText(ctx, truncate(status, font: statusFont, maxW: room), right: Int(right), y: Int(cy) - 10,
+                      font: statusFont, color: color)
         }
         if shuts { chevron(ctx, center: CGPoint(x: rect.maxX - 22, y: cy), up: open) }
     }
@@ -1075,6 +1118,22 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         return parts.joined(separator: " · ")
     }
 
+    /// The billing cycles of the account a member is (from the quotas): the same
+    /// account can be in them locally and via a relay — the copy with most cycles.
+    /// None for a key, a provider, or an account the quotas don't know.
+    private func cycles(of w: MagpieMember, in quotas: [MagpieQuota]) -> [RoutingGroup.Cycle] {
+        guard w.kind == "account", let who = w.who else { return [] }
+        let mine = quotas.filter { q in
+            q.error == nil && q.user == who
+                && (q.provider.split(separator: "/").last.map(String.init) ?? q.provider) == w.provider
+                && (q.plan == nil || w.plan == nil || q.plan == w.plan)
+        }
+        guard let q = mine.max(by: { $0.windows.count < $1.windows.count }) else { return [] }
+        return q.windows.map { win in
+            (used: min(max(win.usedPercent, 0), 100), renews: win.resetsAt)
+        }
+    }
+
     /// 0…1 through a window's current period; nil when its length is unknown.
     private func periodProgress(_ w: MagpieQuotaWindow) -> Double? {
         guard let d = windowDuration(w), let reset = w.resetsAt else { return nil }
@@ -1118,17 +1177,16 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             return
         }
 
-        // Grid: whichever rows × cols makes the circles largest (≤ 3 rows, ≤ 6 cols)
+        // Grid: columns first (up to 3), a row more once they're full (up to 4).
+        // The cards share the panel, so fewer of them are bigger.
         let gap = 6, left = px + 12, top = py + 12
         let areaW = pw - 24, areaH = py + ph - 12 - top
-        var layout = (rows: 1, cols: 1, cardW: 0, cardH: 0, radius: CGFloat(0))
-        for rows in 1...3 {
-            let cols = (cards.count + rows - 1) / rows
-            guard cols <= 6 else { continue }
-            let cw = (areaW - (cols - 1) * gap) / cols, chh = (areaH - (rows - 1) * gap) / rows
-            let r = circleRadius(cardW: cw, cardH: chh)
-            if r > layout.radius { layout = (rows, cols, cw, chh, r) }
-        }
+        let maxCols = 3, maxRows = 4
+        let cols = min(cards.count, maxCols)
+        let rows = min((cards.count + cols - 1) / cols, maxRows)
+        let cw = (areaW - (cols - 1) * gap) / cols, chh = (areaH - (rows - 1) * gap) / rows
+        let layout = (rows: rows, cols: cols, cardW: cw, cardH: chh,
+                      radius: circleRadius(cardW: cw, cardH: chh))
         let capacity = layout.rows * layout.cols
         let overflow = cards.count > capacity
         let shown = Array(cards.prefix(overflow ? capacity - 1 : capacity))
