@@ -142,19 +142,38 @@ final class USBDevice: @unchecked Sendable {
 
     /// Write `count` bytes of `data` (all of it by default).
     func bulkWrite(_ data: Data, count: Int? = nil, timeout: UInt32 = 5000) throws -> Int {
-        let length = min(count ?? data.count, data.count)
-        var transferred: Int32 = 0
-        let result = data.withUnsafeBytes { ptr in
+        let length = count ?? data.count
+        guard length >= 0, length <= data.count, length <= Int32.max else {
+            throw USBError.writeFailed(LIBUSB_ERROR_INVALID_PARAM.rawValue)
+        }
+        guard length > 0 else { return 0 }
+        guard let handle else { throw USBError.writeFailed(LIBUSB_ERROR_NO_DEVICE.rawValue) }
+        return try data.withUnsafeBytes { ptr in
             let mutable = UnsafeMutablePointer(
                 mutating: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self))
-            return libusb_bulk_transfer(
-                handle, epOut, mutable, Int32(length),
-                &transferred, timeout)
+            return try Self.writeAll(count: length) { offset, remaining in
+                var transferred: Int32 = 0
+                let result = libusb_bulk_transfer(
+                    handle, epOut, mutable.advanced(by: offset), Int32(remaining),
+                    &transferred, timeout)
+                guard result == LIBUSB_SUCCESS.rawValue else { throw USBError.writeFailed(result) }
+                return Int(transferred)
+            }
         }
-        guard result == LIBUSB_SUCCESS.rawValue else {
-            throw USBError.writeFailed(result)
+    }
+
+    /// A successful transfer can be short. Finish the frame before asking for
+    /// its ACK, and fail rather than spin if the device makes no progress.
+    static func writeAll(count: Int, transfer: (Int, Int) throws -> Int) throws -> Int {
+        var written = 0
+        while written < count {
+            let sent = try transfer(written, count - written)
+            guard sent > 0, sent <= count - written else {
+                throw USBError.writeFailed(LIBUSB_ERROR_IO.rawValue)
+            }
+            written += sent
         }
-        return Int(transferred)
+        return written
     }
 
     func bulkRead(size: Int, timeout: UInt32 = 1000) throws -> Data {

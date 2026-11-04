@@ -97,6 +97,16 @@ struct MagpieRoute: Sendable {
     let ms: Int?
     let tokens: Int?
     let out: Int?
+    // How the reply came out, as the page reads a speed from it (#196): when
+    // its first token, first text and first shown reasoning came, the ms its
+    // content actually streamed over, and its reasoning tokens (the stream
+    // hiding them, when it showed none)
+    let ttft: Int?
+    let firstText: Int?
+    let flow: Int?
+    let firstReasoning: Int?
+    let reasoning: Int?
+    let reasoningHidden: Bool?
     let folder: String?
 
     var inFlight: Bool { !done }
@@ -474,6 +484,13 @@ final class MagpieCollector: @unchecked Sendable {
             ms: r["ms"] as? Int,
             tokens: r["tokens"] as? Int,
             out: r["out"] as? Int,
+            ttft: r["ttft"] as? Int,
+            firstText: r["firstText"] as? Int,
+            flow: r["flow"] as? Int,
+            firstReasoning: r["firstReasoning"] as? Int,
+            reasoning: (r["reasoning"] as? Int)
+                ?? (r["usage"] as? [[String: Any]])?.last?["reasoning"] as? Int,
+            reasoningHidden: r["reasoningHidden"] as? Bool,
             folder: r["folder"] as? String)
     }
 

@@ -17,6 +17,9 @@ enum MagpieConfig {
     private static let keychainAccount = "apiKey"
 
     private static let lock = NSLock()
+    // Serialize persistence and publication, without holding the reader lock
+    // while the Keychain asks the user for permission.
+    private static let saveLock = NSLock()
     nonisolated(unsafe) private static var cachedKey: String?
     nonisolated(unsafe) private static var _generation = 0
 
@@ -68,6 +71,8 @@ enum MagpieConfig {
     }
 
     static func save(url: String, apiKey key: String) throws {
+        saveLock.lock()
+        defer { saveLock.unlock() }
         let url = normalize(url)
         let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
         try writeKeychain(key)

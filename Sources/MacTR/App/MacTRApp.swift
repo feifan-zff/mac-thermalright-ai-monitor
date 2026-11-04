@@ -159,6 +159,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
     private var previewShown = false
+    private var previewRequested = false   // explicitly opened, even with an LCD
     private var previewCanvas = (w: 0, h: 0)   // the screen size the window is shaped for
 
     // Menu items that need updating
@@ -398,7 +399,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Show the dashboard on the Mac while the LCD is disconnected.
     /// Transition-based so we don't grab focus every second.
     private func updateDisplayTarget() {
-        let wantPreview = !appState.isConnected
+        let wantPreview = previewRequested || !appState.isConnected
         if wantPreview && !previewShown {
             showPreview(); previewShown = true
         } else if !wantPreview && previewShown {
@@ -462,6 +463,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func showPreviewManually() {
+        previewRequested = true
         showPreview(); previewShown = true
     }
 
@@ -470,6 +472,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     // transition (LCD unplug).
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
+        previewRequested = false
         previewTimer?.invalidate()
         previewTimer = nil
     }
@@ -541,11 +544,40 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
 // MARK: - CLI Mode
 
+/// Signals request a stop between frames. The dispatch queue is independent of
+/// the main thread, which is occupied by the CLI's synchronous USB loop.
+private final class CLIShutdown: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+    private var sources: [DispatchSourceSignal] = []
+    var requested: Bool { lock.withLock { stopped } }
+
+    init() {
+        let queue = DispatchQueue(label: "com.thermalvision.cli-signals")
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.lock.withLock { self.stopped = true }
+            }
+            source.resume()
+            sources.append(source)
+        }
+    }
+
+    deinit {
+        for source in sources { source.cancel() }
+        for sig in [SIGINT, SIGTERM] { signal(sig, SIG_DFL) }
+    }
+}
+
 // MARK: - Benchmark Mode
 
 /// Measure achievable frame rate on the connected LCD. Breaks timing into render,
 /// JPEG encode, and USB send so we know which stage bounds the fps.
 private func runBenchmark() {
+    let shutdown = CLIShutdown()
     let args = CommandLine.arguments
     let frames = parseFlag(args, flag: "--benchmark") ?? 120
     let brightness = parseFlag(args, flag: "-b") ?? 5
@@ -575,6 +607,7 @@ private func runBenchmark() {
 
     // Warm up: first render + JPEG/rotation contexts allocate; discard 5 frames
     for _ in 0..<5 {
+        if shutdown.requested { break }
         if let img = renderer.render(),
            let j = JPEGEncoder.encode(img, brightness: brightness, rotate180: rotate) {
             try? LYProtocol.sendFrame(device: device, jpegData: j)
@@ -587,6 +620,7 @@ private func runBenchmark() {
     let t0 = now()
 
     for _ in 0..<frames {
+        if shutdown.requested { break }
         let r0 = now()
         let image = staticJPEG == nil ? renderer.render() : nil
         guard staticJPEG != nil || image != nil else { continue }
@@ -684,6 +718,7 @@ private func downscaleImage(_ image: CGImage, _ w: Int, _ h: Int) -> CGImage? {
 }
 
 private func runCLI() {
+    let shutdown = CLIShutdown()
     let args = CommandLine.arguments
     let isTest = args.contains("--test")
     let brightness = parseFlag(args, flag: "-b") ?? 5
@@ -720,15 +755,15 @@ private func runCLI() {
             return
         }
         log("[*] JPEG size: \(jpeg.count) bytes")
-        cliFrameLoop(device: device, staticJPEG: jpeg)
+        cliFrameLoop(device: device, staticJPEG: jpeg, shutdown: shutdown)
     } else {
         let renderer = primedRenderer()
 
+        defer { renderer.stopMetrics() }
         log("[*] Sending frames (press Ctrl+C to stop)...")
-        signal(SIGINT, SIG_DFL)
 
         var count = 0
-        while true {
+        while !shutdown.requested {
             guard let image = renderer.render(),
                   let jpeg = JPEGEncoder.encode(image, brightness: brightness, rotate180: rotate)
             else {
@@ -751,11 +786,10 @@ private func runCLI() {
     }
 }
 
-private func cliFrameLoop(device: USBDevice, staticJPEG: Data) {
+private func cliFrameLoop(device: USBDevice, staticJPEG: Data, shutdown: CLIShutdown) {
     log("[*] Sending frames (press Ctrl+C to stop)...")
-    signal(SIGINT, SIG_DFL)
     var count = 0
-    while true {
+    while !shutdown.requested {
         do {
             try LYProtocol.sendFrame(device: device, jpegData: staticJPEG)
             count += 1
@@ -772,7 +806,7 @@ private func cliFrameLoop(device: USBDevice, staticJPEG: Data) {
 private func primedRenderer() -> MagpieRenderer {
     let renderer = MagpieRenderer()
     renderer.startMetrics()
-    for _ in 0..<50 where renderer.render() == nil { Thread.sleep(forTimeInterval: 0.1) }
+    renderer.waitForFirstSnapshot()
     return renderer
 }
 

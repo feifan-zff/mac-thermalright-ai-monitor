@@ -23,7 +23,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
     private let pollQueue = DispatchQueue(label: "com.thermalvision.magpie")
     private var pollRunning = false
     private var pollGeneration = 0   // a stop→start within one sleep must not leave two loops
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var _snap: MagpieSnapshot?
 
     private let renderMutex = NSLock()
@@ -104,7 +104,15 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
     }
 
     func stopMetrics() {
-        lock.lock(); pollRunning = false; lock.unlock()
+        lock.lock(); pollRunning = false; lock.broadcast(); lock.unlock()
+    }
+
+    /// Export modes need the first completed poll, which can include several
+    /// HTTP requests. Network timeouts belong to URLSession, not a shorter UI timer.
+    func waitForFirstSnapshot() {
+        lock.lock()
+        defer { lock.unlock() }
+        while pollRunning && _snap == nil { lock.wait() }
     }
 
     private func isPolling(_ gen: Int) -> Bool {
@@ -120,7 +128,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
                 // Trace every second; today's usage every 15s, quotas every 30s (both on the first tick)
                 let snap = collector.collect(quotas: tick % 30 == 0, usage: tick % 15 == 0)
                 guard isPolling(gen), snap.generation == MagpieConfig.generation else { return }
-                lock.lock(); _snap = snap; lock.unlock()
+                lock.lock(); _snap = snap; lock.broadcast(); lock.unlock()
                 if snap.online != wasOnline {
                     log("[Magpie] Gateway \(snap.online ? "online" : "offline: \(snap.error ?? "")") (\(collector.baseURL))")
                     wasOnline = snap.online
@@ -423,7 +431,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
 
         // the members' column starts under the clock in the panel's corner
         let rowsTop = top + clockH, avail = bottom - rowsTop, rowGap = 6, minRowH = 40, indent = 28
-        let maxRows = (avail + rowGap) / (minRowH + rowGap)
+        let maxRows = max(1, (avail + rowGap) / (minRowH + rowGap))
         // What fits, most open first: every heading open (a fold of fewer than
         // six accounts, as the page opens one), then the folds shut, then only
         // the lit ways open, then the headings alone
@@ -596,7 +604,9 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
                            groupID: c.groupID, groupRef: c.groupRef, groupName: c.groupName, routing: c.routing,
                            members: c.members, left: [], groupMembers: c.groupMembers, tries: r.tries,
                            phase: r.phase, error: r.error, done: r.done, status: r.status, ms: r.ms,
-                           tokens: r.tokens, out: r.out, folder: r.folder)
+                           tokens: r.tokens, out: r.out, ttft: r.ttft, firstText: r.firstText, flow: r.flow,
+                           firstReasoning: r.firstReasoning, reasoning: r.reasoning, reasoningHidden: r.reasoningHidden,
+                           folder: r.folder)
     }
 
     /// How a row is drawn: as it is for the focused request; another agent's
@@ -870,16 +880,21 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
 
             // The account (a fold: its provider, and how many), then its model
             textX = x + 50
+            // Reserve the status first; long model names must not consume it
+            // on narrower screens. Split the remaining space between labels.
+            let saying = status.isEmpty ? 0 : min(textWidth(status, font: statusFont), max(0, (right - textX) * 0.5)) + 14
+            let contentRight = right - saying
             let title = truncate(row.isFold ? (w.name.isEmpty ? w.provider : w.name) : RoutingGroup.who(w, mask: maskAccount),
-                                 font: titleFont, maxW: (right - textX) * 0.45)
+                                 font: titleFont, maxW: max(0, (contentRight - textX) * 0.45))
             Draw.text(ctx, title, x: Int(textX), y: Int(cy) - 12, font: titleFont, color: on ? Color.textW : Color.textS)
             textX += textWidth(title, font: titleFont) + 8
-            let sub = row.isFold ? "\(row.members.count) 个\(w.kind == "key" ? " Key" : "账号")" : w.fallback ? "备用" : ""
+            let sub = truncate(row.isFold ? "\(row.members.count) 个\(w.kind == "key" ? " Key" : "账号")" : w.fallback ? "备用" : "",
+                               font: subFont, maxW: max(0, (contentRight - textX) * 0.5))
             if !sub.isEmpty {
                 Draw.text(ctx, sub, x: Int(textX), y: Int(cy) - 10, font: subFont, color: Color.textL)
                 textX += textWidth(sub, font: subFont) + 8
             }
-            let model = truncate(w.model, font: mono, maxW: max(40, min(200, right - textX - 14)))
+            let model = truncate(w.model, font: mono, maxW: max(0, min(200, contentRight - textX - 14)))
             let chip = CGRect(x: textX, y: cy - 11, width: textWidth(model, font: mono) + 14, height: 22)
             ctx.setFillColor(Color.barBG)
             ctx.addPath(CGPath(roundedRect: chip, cornerWidth: 5, cornerHeight: 5, transform: nil))
@@ -1214,7 +1229,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         // Two outer diameters (4r + 2 ring widths ≈ 4.3r), side padding, an 8px gap
         let byWidth = (CGFloat(cardW) - 2 * Self.cardPadX - 8) / 4.3
         let byHeight = (CGFloat(cardH) - Self.cardTitleH - 10) / 2 - 4
-        return min(byWidth, byHeight, 56)
+        return max(10, min(byWidth, byHeight, 56))
     }
 
     private func drawUsageCard(_ ctx: CGContext, _ c: UsageCard, rect: CGRect, radius r: CGFloat) {
@@ -1386,6 +1401,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
 
     private func truncate(_ s: String, font: NSFont, maxW: CGFloat) -> String {
         if textWidth(s, font: font) <= maxW { return s }
+        guard textWidth("…", font: font) <= maxW else { return "" }
         let key = "\(s)\u{0}\(font.fontName)\u{0}\(font.pointSize)\u{0}\(maxW)"
         if let t = truncated[key] { return t }
         if truncated.count > 2000 { truncated.removeAll(keepingCapacity: true) }

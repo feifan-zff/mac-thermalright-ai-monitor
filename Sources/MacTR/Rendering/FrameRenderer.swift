@@ -47,16 +47,13 @@ enum JPEGEncoder {
 
         // Encode to JPEG with quality reduction loop. 0.8 is ~15% faster and
         // smaller than 0.9 for a PSNR barely lower (38.0 vs 38.4 dB)
-        var quality = 0.8
-        while quality > 0.3 {
-            if let data = jpegData(from: finalImage, quality: quality) {
-                if data.count <= maxBytes || quality <= 0.3 {
-                    return data
-                }
+        for quality in stride(from: 80, through: 30, by: -5) {
+            if let data = jpegData(from: finalImage, quality: Double(quality) / 100),
+               data.count <= maxBytes {
+                return data
             }
-            quality -= 0.05
         }
-        return jpegData(from: finalImage, quality: 0.3)
+        return nil
     }
 
     private static func jpegData(from image: CGImage, quality: Double) -> Data? {

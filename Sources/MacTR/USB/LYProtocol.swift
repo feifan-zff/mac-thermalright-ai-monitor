@@ -145,6 +145,7 @@ enum LYProtocol {
 
     /// Send one JPEG frame using LY chunked bulk protocol.
     static func sendFrame(device: USBDevice, jpegData: Data) throws {
+        guard jpegData.count <= maxJPEGSize else { throw LYError.frameTooLarge(jpegData.count) }
         let pid = device.pid
         let chunkCmd: UInt8 = (pid == 0x5408) ? 0x01 : 0x02
 

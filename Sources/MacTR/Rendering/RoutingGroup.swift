@@ -182,6 +182,7 @@ enum RoutingGroup {
         var gave: [String: MagpieTry] = [:], went: [String: MagpieTry] = [:]
         var rests: [String: MagpieRest] = [:]
         var served: [String: String] = [:]   // what answered, by member
+        var speed: [String: String] = [:]    // how fast it answered, by member ("87 tok/s")
 
         init(_ r: MagpieRoute, now: Date) {
             for w in r.members { if let rest = w.rest { rests[w.id] = rest } }
@@ -194,6 +195,31 @@ enum RoutingGroup {
                 if let rest = t.rest { rests[t.id] = rest }
             }
             for id in answered { rests[id] = nil }   // it answered: whatever rest it began in is over
+            // The reply's tokens belong to the last try that answered. How fast
+            // the model wrote is the page's decode (#196, #731): its answer over
+            // the window it wrote in. When that cannot be told — no first token,
+            // or a burst a relay let go at its end — no speed is shown
+            if let answeredLast = r.tries.last(where: { $0.done && !$0.failed }),
+               let out = r.out, out > 0 {
+                // Route timestamps include earlier attempts; try timestamps do not.
+                // Only use a pair measured from the same origin. Without route
+                // timing, reasoning timestamps cannot safely be attributed to a try.
+                let timing: (ms: Int, ttft: Int?)?
+                if let ms = r.ms, let ttft = r.ttft {
+                    timing = (ms, ttft)
+                } else if (r.reasoning ?? 0) == 0, r.reasoningHidden != true,
+                          r.firstText == nil, r.firstReasoning == nil, let ms = answeredLast.ms {
+                    timing = (ms, answeredLast.ttft)
+                } else {
+                    timing = nil
+                }
+                if let timing,
+                   let d = RoutingGroup.decode(out: out, ms: timing.ms, ttft: timing.ttft, firstText: r.firstText,
+                                               flow: r.flow, firstReasoning: r.firstReasoning,
+                                               reasoning: r.reasoning, reasoningHidden: r.reasoningHidden) {
+                    speed[answeredLast.id] = "\(Int((Double(d.n) * 1000 / Double(d.w)).rounded())) tok/s"
+                }
+            }
         }
     }
 
@@ -207,9 +233,10 @@ enum RoutingGroup {
         else if w.window != nil { s = "超出上下文" }
         else if f.trying.contains(w.id) { s = "回答中" }
         else if f.answered.contains(w.id) {
-            // A remote magpie (a provider, not an account) hides who is behind it:
-            // the model it served says it
-            s = w.kind == "provider" ? f.served[w.id] ?? "已回答" : "已回答"
+            // How fast it put the reply out says how it answered; until its
+            // tokens land, a remote magpie (a provider, not an account) hides
+            // who is behind it: the model it served says it
+            s = f.speed[w.id] ?? (w.kind == "provider" ? f.served[w.id] ?? "已回答" : "已回答")
         }
         else if let t = f.gave[w.id] ?? f.went[w.id] {
             // a quota failure has no word (the bar says it): its renewal says when it is back
@@ -264,6 +291,36 @@ enum RoutingGroup {
 
     static func who(_ w: MagpieMember, mask: (String) -> String) -> String {
         w.kind == "provider" ? w.name : (w.who.map(mask) ?? w.name)
+    }
+
+    /// A reply's answer and the window it wrote it in, as the page's decodeOf
+    /// tells it (#196, #731). The answer is its output less the reasoning the
+    /// stream kept hidden (it was written before the stream showed any); the
+    /// window runs from its first text, or its first reasoning when only that
+    /// was shown. Nil when it cannot be told: no first token, a window under
+    /// 100 ms or beyond 10,000 tok/s, or one that came in a burst — a relay
+    /// held the reply back and let it go at its end (its content in under a
+    /// quarter of its window, or its answer at over 20 times the pace its
+    /// reasoning came before its first text).
+    static func decode(out: Int, ms: Int, ttft: Int?, firstText: Int?, flow: Int?,
+                       firstReasoning: Int?, reasoning: Int?, reasoningHidden: Bool?) -> (n: Int, w: Int)? {
+        guard let ttft, ttft > 0, ms > 0, out > 0 else { return nil }
+        let think = reasoning ?? 0
+        let text = firstText ?? 0, began = firstReasoning ?? 0, ran = flow ?? 0
+        guard think >= 0, think <= out, text >= 0, began >= 0, ran >= 0 else { return nil }
+        if (reasoningHidden ?? false) && text <= 0 { return nil }
+        // reasoning shown on its own counts: the window is from where it began
+        let visible = think > 0 && text <= 0 && began >= ttft && ran > 0 && think <= out
+        let n = think > 0 && !visible ? out - think : out
+        let from = visible ? began : (think > 0 ? text : ttft)
+        guard n > 0, from > 0, from < ms else { return nil }
+        let w = ms - from
+        // The trace is external data: products of valid Int values can overflow.
+        let count = Double(n), window = Double(w)
+        guard w >= 100, count * 1000 <= 10000 * window else { return nil }
+        if ran > 0 && Double(ran) * 4 < window { return nil }
+        if think > 0 && text > 0 && count * (Double(text) - Double(ttft)) > 20 * Double(think) * window { return nil }
+        return (n, w)
     }
 
     /// One billing cycle of an account: how much of it is used (0…100) and when
