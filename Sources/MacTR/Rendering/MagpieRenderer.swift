@@ -56,20 +56,45 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
     // magpie is seen in (it flies under the cards), so they're wide enough for one.
     // Drawn for a 1920-wide screen; a narrower one shrinks the columns (and the
     // magpies) in step, the heights stay.
+    // The scale follows the screen, not how many cards the usage panel holds: the
+    // width its missing columns give up (spareW) goes to the two outer columns —
+    // two fifths to the agent cards, the rest to the members' column (whatever
+    // the others leave). The hub and the wires' gaps keep their width.
     private static let designUsageW = 732, designRouteW: CGFloat = 1150
-    private var stageScale: CGFloat { min(1, CGFloat(routeW) / Self.designRouteW) }
-    private var agentW: Int { Int(184 * stageScale) }
+    private var stageScale: CGFloat { min(1, CGFloat(routeFullW) / Self.designRouteW) }
+    private var agentW: Int { Int(184 * stageScale) + spareW * 2 / 5 }
     private var hubW: Int { Int(176 * stageScale) }
     private var wireGap: Int { Int(104 * stageScale) }
     private let hubH = 160
     private var birdScale: CGFloat { 1.6 * stageScale }   // LCD px per page px for the flight
 
     // Layout
-    // 订阅用量 on the left, 路由 on the right
+    // 订阅用量 on the left, 路由 on the right. The usage panel is only as wide as
+    // its columns of cards: one compact card width each (a full three of them
+    // fill designUsageW), and what fewer columns leave over is the routing's.
+    private static let usageMaxCols = 3, usageMaxRows = 3
+    private static let usagePad = 12, usageGap = 6
     private let usageX = Layout.margin
-    private var usageW: Int { Layout.width * Self.designUsageW / 1920 }
+    private var usageCols = 1      // as of this frame's quotas (render)
+    private var usageColsFor = -1  // the quotaVersion usageCols was worked out for
+    private var usageCardW: Int {
+        (Layout.width * Self.designUsageW / 1920 - 2 * Self.usagePad - (Self.usageMaxCols - 1) * Self.usageGap)
+            / Self.usageMaxCols
+    }
+    private func usageWidth(cols: Int) -> Int {
+        2 * Self.usagePad + cols * usageCardW + (cols - 1) * Self.usageGap
+    }
+    /// A column holds up to usageMaxRows cards; the next opens only once it's full.
+    private static func usageColumns(for cards: Int) -> Int {
+        max(1, min((cards + usageMaxRows - 1) / usageMaxRows, usageMaxCols))
+    }
+    private var usageW: Int { usageWidth(cols: usageCols) }
     private var routeX: Int { usageX + usageW + Layout.gap }
     private var routeW: Int { Layout.width - Layout.margin - routeX }
+    private var routeFullW: Int {   // the routing panel beside a full set of columns
+        Layout.width - Layout.margin - (usageX + usageWidth(cols: Self.usageMaxCols) + Layout.gap)
+    }
+    private var spareW: Int { routeW - routeFullW }
 
     // The screen size the cached layers were drawn for
     private var canvas = (w: 0, h: 0)
@@ -210,6 +235,12 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             usageCtx = nil; usageImage = nil; usageKey = ""
             reusableCtx = nil
             groupRows = nil
+            usageColsFor = -1
+        }
+        // The panels' split follows the number of cards, so it's settled before any layer
+        if usageColsFor != snap.quotaVersion {
+            usageColsFor = snap.quotaVersion
+            usageCols = Self.usageColumns(for: usageCards(snap.quotas).count)
         }
         let full = CGRect(x: 0, y: 0, width: w, height: h)
         let now = Date().timeIntervalSince1970
@@ -233,7 +264,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
 
         // Base layer: news (the snapshot's version, not each poll), the requests
         // played, or a clock text ticking over ("26秒前", "回答中 8s", the time)
-        let key = "\(snap.version)|\(focus?.id ?? 0)|\(active.sorted())|\(tick(snap, now: now))|\(DisplayShape.cornerRadius)"
+        let key = "\(snap.version)|\(focus?.id ?? 0)|\(active.sorted())|\(tick(snap, now: now))|\(usageCols)|\(DisplayShape.cornerRadius)"
         if key != baseKey || baseImage == nil {
             if baseCtx == nil { baseCtx = makeContext() }
             guard let bc = baseCtx else { return nil }
@@ -274,7 +305,7 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
     /// Blit the cached usage panel into `ctx` (unflipped, native coords).
     private func drawUsage(_ ctx: CGContext, snap: MagpieSnapshot, now: Double) {
         // new quotas, or the minute: its pace rings and "3天后" move by minutes at most
-        let key = "\(snap.quotaVersion)|\(Int(now / 60))|\(snap.online)|\(DisplayShape.cornerRadius)"
+        let key = "\(snap.quotaVersion)|\(Int(now / 60))|\(snap.online)|\(usageCols)|\(DisplayShape.cornerRadius)"
         if key != usageKey || usageImage == nil {
             if usageCtx == nil { usageCtx = makeContext() }
             guard let uc = usageCtx else { return }
@@ -1192,13 +1223,14 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
             return
         }
 
-        // Grid: columns first (up to 3), a row more once they're full (up to 4).
-        // The cards share the panel, so fewer of them are bigger.
-        let gap = 6, left = px + 12, top = py + 12
-        let areaW = pw - 24, areaH = py + ph - 12 - top
-        let maxCols = 3, maxRows = 4
-        let cols = min(cards.count, maxCols)
-        let rows = min((cards.count + cols - 1) / cols, maxRows)
+        // Grid, filled down a column before the next one starts: a column holds up
+        // to 3 cards, a new column (up to 3) opens only once it's full; the rows
+        // then even out across the columns. The panel is as wide as its columns
+        // (usageW), so a card is the same compact width however many there are.
+        let gap = Self.usageGap, left = px + Self.usagePad, top = py + Self.usagePad
+        let areaW = pw - 2 * Self.usagePad, areaH = py + ph - Self.usagePad - top
+        let cols = usageCols
+        let rows = min((cards.count + cols - 1) / cols, Self.usageMaxRows)
         let cw = (areaW - (cols - 1) * gap) / cols, chh = (areaH - (rows - 1) * gap) / rows
         let layout = (rows: rows, cols: cols, cardW: cw, cardH: chh,
                       radius: circleRadius(cardW: cw, cardH: chh))
@@ -1206,8 +1238,8 @@ final class MagpieRenderer: FrameRenderer, @unchecked Sendable {
         let overflow = cards.count > capacity
         let shown = Array(cards.prefix(overflow ? capacity - 1 : capacity))
         func slot(_ i: Int) -> CGRect {
-            CGRect(x: left + (i % layout.cols) * (layout.cardW + gap),
-                   y: top + (i / layout.cols) * (layout.cardH + gap),
+            CGRect(x: left + (i / layout.rows) * (layout.cardW + gap),
+                   y: top + (i % layout.rows) * (layout.cardH + gap),
                    width: layout.cardW, height: layout.cardH)
         }
         for (i, c) in shown.enumerated() {
